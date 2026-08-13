@@ -119,7 +119,8 @@ vec3 getEnvColor(vec3 ray) {
   uv = uv * (1. / pi) + 0.5;
   uv.x = fract(uv.x);
   vec3 color = texture2D(envMap, uv).rgb;
-  return 1. - exp(-0.1 * color);
+  // Rolloff tuned to this HDR: at -0.1 the studio map reflected near-black.
+  return 1. - exp(-0.45 * color);
 }
 
 vec3 getIridescence(vec3 rd, vec3 n) {
@@ -137,7 +138,8 @@ vec3 getNormal() {
   vec3 n = normalize(vNormal);
   vec3 t = normalize(vTangent);
   vec3 b = normalize(vBitangent);
-  float ridge = sin(vUv.y * 90. + vUv.x * 14.) * 0.04;
+  // Enough to break up flat facets; at 0.04 this striped the blade white.
+  float ridge = sin(vUv.y * 90. + vUv.x * 14.) * 0.012;
   return normalize(n + t * ridge);
 }
 

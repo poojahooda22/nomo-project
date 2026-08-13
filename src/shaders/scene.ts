@@ -25,12 +25,16 @@ uniform float seconds;
 void main() {
   vec2 c = vUv - vec2(0.5, 0.55);
   float r = length(c * vec2(1.6, 1.));
-  vec3 deep = vec3(0.004, 0.004, 0.028);
-  vec3 pool = vec3(0.012, 0.03, 0.14);
+  // The reference frame is near-black away from the beam.
+  vec3 deep = vec3(0.001, 0.001, 0.007);
+  vec3 pool = vec3(0.003, 0.008, 0.035);
   vec3 col = mix(pool, deep, smoothstep(0.05, 0.85, r));
-  // vertical column of light behind the feather: what the glass refracts
   float column = exp(-10. * abs(vUv.x - 0.5)) * smoothstep(0.0, 0.55, vUv.y);
-  col += vec3(0.1, 0.16, 0.5) * column;
+  col += vec3(0.025, 0.04, 0.125) * column;
+  // A bright core directly behind the feather: this is what the glass
+  // refracts and disperses. Without it the dispersion has nothing to bend.
+  vec2 cv = (vUv - vec2(0.5, 0.5)) * vec2(2.2, 1.1);
+  col += vec3(0.5, 0.62, 1.2) * exp(-16. * dot(cv, cv));
   gl_FragColor = vec4(col, 1.);
 }
 `;
@@ -64,17 +68,34 @@ uniform float emissionFactor, emissionWhiteness, interpol, type, blueness, opaci
 
 float saturate1(float x) { return clamp(x, 0., 1.); }
 
-void main() {
-  vec3 normal0 = type < 1. ? texture2D(normalMap, vUv).xyz : vec3(0.);
-  vec3 normal1 = vec3(0.);
-  if (type > 0.) {
-    vec2 texel = texture2D(simpleMap, vUv).xy;
-    float h = mix(texel.y, texel.x, interpol);
-    normal1 = vec3(dFdx(h), 0., dFdy(h));
-  }
-  vec3 normal = normalize(mix(normal0, normal1, type) + vec3(0., 1e-5, 0.));
+uniform vec2 simpleTexel;
+uniform float hazeScale;
 
-  vec2 uv = vScreenUv + normal.xz;
+float rippleHeight(vec2 uv) {
+  vec2 texel = texture2D(simpleMap, uv).xy;
+  return mix(texel.y, texel.x, interpol);
+}
+
+void main() {
+  /* The slope is measured by sampling the height field at its own texel
+     offsets and is NEVER normalised: normalising a y-less vector returns
+     a full-length unit vector for the faintest wave, which painted a
+     quad-quantised blue wash over the whole frame. Magnitude is signal. */
+  vec2 offset = vec2(0.);
+  vec2 slope = vec2(0.);
+  if (type < 1.) {
+    vec3 n0 = texture2D(normalMap, vUv).xyz;
+    offset = n0.xz * hazeScale;
+  } else {
+    float hl = rippleHeight(vUv - vec2(simpleTexel.x, 0.));
+    float hr = rippleHeight(vUv + vec2(simpleTexel.x, 0.));
+    float hb = rippleHeight(vUv - vec2(0., simpleTexel.y));
+    float ht = rippleHeight(vUv + vec2(0., simpleTexel.y));
+    slope = vec2(hr - hl, ht - hb);
+    offset = slope * hazeScale * 4.;
+  }
+
+  vec2 uv = vScreenUv + offset;
   vec3 final = texture2D(map, uv).rgb;
 
   if (type < 1.) {
@@ -85,7 +106,10 @@ void main() {
   }
 
   if (type > 0.) {
-    final.b += (saturate1(normal.x) + saturate1(-normal.z)) * blueness;
+    /* Gated by real wave energy and left UNSATURATED, so a faint distant
+       ripple stays faint instead of being promoted to full blue. */
+    float energy = min(length(slope) * 1.5, 1.);
+    final.b += energy * energy * blueness;
   }
 
   vec2 vig = vUv * (1. - vUv) * 0.99 + 0.005;
@@ -180,8 +204,14 @@ void main() {
   vec2 panningUV = -4. * vUv;  panningUV.y += seconds;
   vec4 noise = texture2D(noisesMap, panningUV);
   vec2 distortedUV = vUv + noise.rg * 0.01;
-  vec3 trail = texture2D(trailMap, distortedUV).rgb;
-  gl_FragColor = vec4(trail * vec3(0.1, 0.1, 1.), trail.r * 0.25);
+  /* Two traps live here. The wave field oscillates below zero, and
+     blending negative colour with negative alpha SUBTRACTS blue from the
+     frame (prints yellow). And trailMap is an RG texture: its .rgb is
+     (height, prevHeight, 0) - the blue channel is zero BY FORMAT, so
+     tinting the raw channels can only ever produce yellow. The colour must
+     be built from the height scalar. */
+  float h = min(max(texture2D(trailMap, distortedUV).r, 0.), 2.);
+  gl_FragColor = vec4(vec3(0.1, 0.1, 1.) * h, clamp(h * 0.25, 0., 1.));
 }
 `;
 

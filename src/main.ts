@@ -4,7 +4,7 @@ import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { DRACOLoader } from 'three/examples/jsm/loaders/DRACOLoader.js';
 import { RGBELoader } from 'three/examples/jsm/loaders/RGBELoader.js';
 import { FluidSim } from './FluidSim';
-import { RippleSim } from './RippleSim';
+import { RippleSim, RIPPLE_SIM_SIZE } from './RippleSim';
 import { PostChain } from './PostChain';
 import { makeColorsLUT } from './lut';
 import { GLASS_FRAGMENT, GLASS_VERTEX } from './shaders/glass';
@@ -42,13 +42,27 @@ const LITE = params.has('lite');
 const qdpr = Number(params.get('qdpr'));
 const DPR = Number.isFinite(qdpr) && qdpr > 0 ? qdpr : LITE ? 0.75 : Math.min(window.devicePixelRatio || 1, 2);
 const FLUID_PIXELS = LITE ? 2 ** 16 : 2 ** 18;
-const SPAWN_VELOCITY = 1.6;
-const SPAWN_DENSITY = 0.35;
+/* Injected EVERY frame against dissipation 0.99: steady state is
+   injection / 0.01, so 1.6 here meant a plume velocity near 160, a
+   permanently over-driven convection cell. These keep the idle plume
+   alive but breathing. */
+const SPAWN_VELOCITY = 0.05;
+const SPAWN_DENSITY = 0.012;
+
+// Layer isolation switches: how the artifacts above were pinned down.
+const SHOW = {
+  fluidCloud: !params.has('nofluidcloud'),
+  rippleCloud: !params.has('noripplecloud'),
+  feather: !params.has('nofeather'),
+  post: !params.has('nopost'),
+  trail: !params.has('notrail'),
+};
 
 declare global {
   interface Window {
     __hero?: {
       splat: (x: number, y: number, dx: number, dy: number) => void;
+      pointer: (x: number, y: number) => void;
       stats: () => Record<string, number | boolean>;
     };
   }
@@ -205,13 +219,20 @@ function makeCloud(type: number): THREE.ShaderMaterial {
       deltaMap: { value: null },
       map: { value: null },
       simpleMap: { value: null },
-      color: { value: new THREE.Color(1.0, 0.35, 0.8) },
-      emissionFactor: { value: 12.0 },
-      emissionWhiteness: { value: 0.25 },
+      /* The delta texture's channels are normal-component differences,
+         not colours; shown raw they skew green-yellow. High whiteness
+         collapses them to luminance FIRST so the pink tint shows, and
+         factor 6 blooms without clipping to white. */
+      color: { value: new THREE.Color(1.0, 0.28, 0.75) },
+      emissionFactor: { value: 6.0 },
+      emissionWhiteness: { value: 0.85 },
       interpol: { value: 0.5 },
       type: { value: type },
-      blueness: { value: 0.6 },
+      blueness: { value: 0.28 },
       opacity: { value: type < 1 ? 1.0 : 0.85 },
+      simpleTexel: { value: new THREE.Vector2(1 / RIPPLE_SIM_SIZE, 1 / RIPPLE_SIM_SIZE) },
+      // Subtle heat-haze, not a lens blob.
+      hazeScale: { value: type < 1 ? 0.02 : 0.05 },
     },
     transparent: true,
     depthWrite: false,
@@ -300,6 +321,19 @@ gltf.load('/models/feather.glb', (g) => {
   const height = bb.max.y - bb.min.y;
   const scale = 1.9 / height;
 
+  /* _thickness is authored in model units, but the refraction march happens
+     in world space: unscaled, both refraction rays land on the same pixel
+     and there is no dispersion at all. Normalise so the thickest point
+     pushes the ray ~0.3 world units, whatever the asset's own scale. */
+  const thicknessAttr = geo.getAttribute('_thickness') as THREE.BufferAttribute | undefined;
+  let maxThickness = 0.1;
+  if (thicknessAttr) {
+    for (let i = 0; i < thicknessAttr.count; i++) {
+      maxThickness = Math.max(maxThickness, thicknessAttr.getX(i));
+    }
+  }
+  const thicknessScale = 0.3 / maxThickness;
+
   glassMat = new THREE.ShaderMaterial({
     vertexShader: GLASS_VERTEX,
     fragmentShader: GLASS_FRAGMENT,
@@ -326,7 +360,7 @@ gltf.load('/models/feather.glb', (g) => {
       colorCurveB: { value: 1 },
       envReflection: { value: 1.6 },
       maxColorValue: { value: 100 },
-      distancesFactor: { value: 0.45 },
+      distancesFactor: { value: thicknessScale },
       resetDistances: { value: 0 },
       peaksFactor: { value: 2.45 },
       baseColor: { value: new THREE.Color(0.85, 0.78, 1.0) },
@@ -425,8 +459,10 @@ function frame(): void {
     spawnerTex = spawnerRT.texture;
   }
 
-  // 2. Simulations.
-  fluid.step(spawnerTex, SPAWN_VELOCITY * dt * 60, SPAWN_DENSITY * dt * 60);
+  // 2. Simulations. The spawner breathes on a slow cycle instead of
+  //    injecting a constant stream.
+  const breath = 0.7 + 0.3 * Math.sin(seconds * 0.5);
+  fluid.step(spawnerTex, SPAWN_VELOCITY * breath * dt * 60, SPAWN_DENSITY * breath * dt * 60);
   ripple.step(seconds);
 
   // 3. Background -> rtA.
@@ -446,6 +482,8 @@ function frame(): void {
   fluidCloudMat.uniforms.map.value = rtA.texture;
   rippleCloudMat.uniforms.simpleMap.value = ripple.texture;
   rippleCloudMat.uniforms.map.value = rtA.texture;
+  fluidCloudMat.visible = SHOW.fluidCloud;
+  rippleCloudMesh.visible = SHOW.rippleCloud;
   renderer.render(cloudScene, blitCam);
 
   // 5. rtBG + feather -> rtFinal.
@@ -453,17 +491,25 @@ function frame(): void {
   renderer.setRenderTarget(rtFinal);
   renderer.clear(true, true, false);
   renderer.render(blitScene, blitCam);
-  if (featherMesh && glassMat) {
+  if (featherMesh && glassMat && SHOW.feather) {
     glassMat.uniforms.map.value = rtBG.texture;
     glassMat.uniforms.seconds.value = seconds;
     renderer.render(featherScene, camera);
   }
 
   // 6. Post to screen, then the trail overlay on top.
-  post.render(rtFinal, seconds);
-  trailMat.uniforms.trailMap.value = ripple.texture;
-  trailMat.uniforms.seconds.value = seconds;
-  renderer.render(trailScene, blitCam);
+  if (SHOW.post) {
+    post.render(rtFinal, seconds);
+  } else {
+    blitMat.uniforms.map.value = rtFinal.texture;
+    renderer.setRenderTarget(null);
+    renderer.render(blitScene, blitCam);
+  }
+  if (SHOW.trail) {
+    trailMat.uniforms.trailMap.value = ripple.texture;
+    trailMat.uniforms.seconds.value = seconds;
+    renderer.render(trailScene, blitCam);
+  }
 
   // Cursor ring easing.
   if (ring) {
@@ -476,6 +522,13 @@ frame();
 
 window.__hero = {
   splat: (x, y, dx, dy) => fluid.splatAt(x, y, dx, dy),
+  // Scripted pointer path for the verification harness: exactly what a
+  // real pointermove feeds, including the first-event edge case.
+  pointer: (x, y) => {
+    pointerNow.set(x, y);
+    fluid.setPointer(x, y);
+    ripple.setPointer(x, y);
+  },
   stats: () => ({
     dpr: DPR,
     fluidPixels: FLUID_PIXELS,

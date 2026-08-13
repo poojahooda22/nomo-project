@@ -166,7 +166,11 @@ export class PostChain {
         bloomRadius: { value: 0.67 },
         bloomPower: { value: 0.17 },
         haloShift: { value: 0.0 },
-        haloPower: { value: 0.5 },
+        /* The halo pass splits R/G from B by 12.5 texels: R+G without B is
+           yellow, printing ghost arcs near the frame edges. The reference
+           ships this pass but runs it at power ZERO (captured live value).
+           Kept in the chain, disabled by default, raise to taste. */
+        haloPower: { value: 0.0 },
         haloMin: { value: 0.45 },
         haloMax: { value: 0.75 },
         haloAnaglyphWidth: { value: 12.5 },

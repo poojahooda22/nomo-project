@@ -8,7 +8,8 @@ import * as THREE from 'three';
  * texels out for wider, softer waves.
  */
 
-const SIM_SIZE = 384;
+export const RIPPLE_SIM_SIZE = 384;
+const SIM_SIZE = RIPPLE_SIM_SIZE;
 
 const VERT = /* glsl */ `
 in vec2 position;
@@ -32,7 +33,13 @@ uniform vec2 aspect, texelSize, pointer, oldPointer;
 uniform float seconds, renderPointer;
 uniform sampler2D map;
 #define pi 3.141592653589793
-#define simDamping 0.98
+/* Damping and injection are a pair. The captured 0.98 assumes a brief
+   stroke; under a sustained sweep it accumulates energy across the whole
+   domain until every texel has slope and the consumer paints the entire
+   screen blue. Faster decay plus a gentler impulse keeps the shimmer
+   local to the cursor, which is the point of this sim. */
+#define simDamping 0.962
+#define rippleGain 0.6
 #define trailSize 0.035
 #define trailPulseWidth 0.02
 #define trailPulseFrequency pi * 4.
@@ -60,8 +67,11 @@ void main() {
   float l = texture(map, uv - e.xz).x;
   float r = texture(map, uv + e.xz).x;
   vec2 prev = texture(map, uv).xy;
-  float res = ripple * 2. + (t + r + b + l) * 0.5 - prev.y;
+  float res = ripple * rippleGain + (t + r + b + l) * 0.5 - prev.y;
   res *= simDamping;
+  // Hard ceiling: a stalled frame or batched events must not let the
+  // field run away into a standing wave that never decays.
+  res = clamp(res, -1.5, 1.5);
   fragColor = vec2(res, prev.x);
 }
 `;
@@ -73,8 +83,8 @@ export class RippleSim {
   private material: THREE.RawShaderMaterial;
   private read: THREE.WebGLRenderTarget;
   private write: THREE.WebGLRenderTarget;
-  private pointer = new THREE.Vector2(0.5, 0.5);
-  private oldPointer = new THREE.Vector2(0.5, 0.5);
+  private pointer = new THREE.Vector2(-1, -1);
+  private oldPointer = new THREE.Vector2(-1, -1);
   private hasPointer = false;
 
   constructor(renderer: THREE.WebGLRenderer) {
@@ -118,6 +128,17 @@ export class RippleSim {
   }
 
   setPointer(x: number, y: number): void {
+    /* First event, or a jump too long to be a stroke (tab refocus, cursor
+       re-entry): collapse both points onto the new position so no phantom
+       wave is stamped from wherever the pointer used to be. */
+    const first = this.pointer.x < 0;
+    const jump = !first && Math.hypot(x - this.pointer.x, y - this.pointer.y) > 0.25;
+    if (first || jump) {
+      this.pointer.set(x, y);
+      this.oldPointer.set(x, y);
+      this.hasPointer = true;
+      return;
+    }
     this.oldPointer.copy(this.pointer);
     this.pointer.set(x, y);
     this.hasPointer = true;

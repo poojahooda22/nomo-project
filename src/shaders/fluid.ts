@@ -114,14 +114,17 @@ void main () {
 }
 `;
 
+/* Displacement always uses the VELOCITY grid's texel. The dye runs at 2x
+   sim resolution, and scaling by the dye's own (half-size) texel made the
+   dye drift at half the speed of the flow carrying it. */
 export const FLUID_ADVECTION = HEADER + /* glsl */ `
 uniform sampler2D uVelocity;
 uniform sampler2D uSource;
-uniform vec2 texelSize;
+uniform vec2 velTexelSize;
 uniform float ds;
 uniform float dissipation;
 void main () {
-  vec2 coord = vUv - ds * texture2D(uVelocity, vUv).xy * texelSize;
+  vec2 coord = vUv - ds * texture2D(uVelocity, vUv).xy * velTexelSize;
   gl_FragColor.rgb = dissipation * texture2D(uSource, coord).rgb;
   gl_FragColor.a = 1.;
 }

@@ -26,12 +26,24 @@ import {
 
 const PRESSURE_ITERATIONS = 2;
 const VELOCITY_DISSIPATION = 0.99;
-const DENSITY_DISSIPATION = 0.97;
+const DENSITY_DISSIPATION = 0.955;
 const PRESSURE_DECAY = 0.99;
 const CURL_STRENGTH = 10;
 const SPLAT_RADIUS = 0.0015;
 const NORMAL_EPSILON = 0.005;
 const DS = 1 / 60;
+/* Caps the per-event pointer delta before the 1e4 amplification: batched
+   pointer events or a frame hiccup must never inject velocity in the
+   hundreds.
+   The captured reference splat colour for a real downward flick was
+   [0, -33.9, 1], i.e. a delta near 0.0034; this ceiling sits just above
+   that so a deliberate flick is strong and nothing else can run away. */
+const MAX_IMPULSE = 0.006;
+/* The dye takes a fraction of the impulse. At full strength the dye field
+   clips for seconds, and a clipped interior is FLAT - the edge detector
+   then finds nothing but the outer border, drawing one fat blob instead
+   of wire-thin filaments. */
+const DYE_STAMP_SCALE = 0.12;
 
 interface PingPong {
   read: THREE.WebGLRenderTarget;
@@ -137,6 +149,7 @@ export class FluidSim {
     Object.assign(this.mats.advection.uniforms, {
       uVelocity: { value: null },
       uSource: { value: null },
+      velTexelSize: { value: new THREE.Vector2() },
       ds: { value: DS },
       dissipation: { value: 1 },
     });
@@ -194,6 +207,12 @@ export class FluidSim {
   }
 
   private doSplat(prev: THREE.Vector2, point: THREE.Vector2, dx: number, dy: number): void {
+    const len = Math.hypot(dx, dy);
+    if (len > MAX_IMPULSE) {
+      const k = MAX_IMPULSE / len;
+      dx *= k;
+      dy *= k;
+    }
     const m = this.mats.splat;
     m.uniforms.aspectRatio.value = this.simW / this.simH;
     (m.uniforms.point.value as THREE.Vector2).copy(point);
@@ -203,6 +222,11 @@ export class FluidSim {
     m.uniforms.baseMap.value = this.velocity.read.texture;
     this.blit(m, this.velocity.write, this.simW, this.simH);
     this.velocity.swap();
+    (m.uniforms.color.value as THREE.Vector3).set(
+      dx * 1e4 * DYE_STAMP_SCALE,
+      dy * 1e4 * DYE_STAMP_SCALE,
+      1,
+    );
     m.uniforms.baseMap.value = this.density.read.texture;
     this.blit(m, this.density.write, this.simW * 2, this.simH * 2);
     this.density.swap();
@@ -260,6 +284,7 @@ export class FluidSim {
     this.velocity.swap();
 
     const adv = this.mats.advection;
+    (adv.uniforms.velTexelSize.value as THREE.Vector2).set(1 / w, 1 / h);
     adv.uniforms.uVelocity.value = this.velocity.read.texture;
     adv.uniforms.uSource.value = this.velocity.read.texture;
     adv.uniforms.dissipation.value = VELOCITY_DISSIPATION;
