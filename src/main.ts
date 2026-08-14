@@ -46,8 +46,8 @@ const FLUID_PIXELS = LITE ? 2 ** 16 : 2 ** 18;
    injection / 0.01, so 1.6 here meant a plume velocity near 160, a
    permanently over-driven convection cell. These keep the idle plume
    alive but breathing. */
-const SPAWN_VELOCITY = 0.05;
-const SPAWN_DENSITY = 0.012;
+const SPAWN_VELOCITY = 0.07;
+const SPAWN_DENSITY = 0.024;
 
 // Layer isolation switches: how the artifacts above were pinned down.
 const SHOW = {
@@ -136,10 +136,13 @@ const beamMat = new THREE.ShaderMaterial({
   vertexShader: BEAM_VERTEX,
   fragmentShader: BEAM_FRAGMENT,
   uniforms: {
-    color: { value: new THREE.Color(0.4, 0.5, 1.0) },
-    intensity: { value: 2.8 },
-    falloff: { value: 0.32 },
-    opacity: { value: 0.06 },
+    color: { value: new THREE.Color(0.45, 0.55, 1.0) },
+    // Narrow and HOT: the reference beam is a thin bright shaft with a
+    // visible core, not a wide dim wash. Brightness comes from intensity
+    // on slim geometry; softness from the layered widths + bloom.
+    intensity: { value: 3.2 },
+    falloff: { value: 0.5 },
+    opacity: { value: 0.05 },
   },
   transparent: true,
   blending: THREE.AdditiveBlending,
@@ -147,8 +150,9 @@ const beamMat = new THREE.ShaderMaterial({
   side: THREE.DoubleSide,
 });
 const beamGroup = new THREE.Group();
-for (let i = 0; i < 3; i++) {
-  const plane = new THREE.Mesh(new THREE.PlaneGeometry(0.9 - i * 0.25, 9), beamMat);
+const BEAM_WIDTHS = [0.55, 0.32, 0.14];
+for (let i = 0; i < BEAM_WIDTHS.length; i++) {
+  const plane = new THREE.Mesh(new THREE.PlaneGeometry(BEAM_WIDTHS[i], 9), beamMat);
   plane.rotation.y = (i * Math.PI) / 3;
   plane.rotation.z = Math.PI; // local +y points down: bright top, fade down
   plane.position.set(0, 3.6, -0.3);
@@ -207,6 +211,61 @@ const dust = new THREE.Points(dustGeo, dustMat);
 dust.frustumCulled = false;
 bgScene.add(dust);
 
+/* Spark stream: a second, tighter particle system that rises INSIDE the
+   beam column — one coherent upward current of bright motes, distinct
+   from the ambient drifting dust ("particles moving in one flame"). */
+const SPARK_COUNT = 110;
+const sparkGeo = new THREE.BufferGeometry();
+{
+  const pos = new Float32Array(SPARK_COUNT * 3);
+  const birth = new Float32Array(SPARK_COUNT);
+  const size = new Float32Array(SPARK_COUNT);
+  const opac = new Float32Array(SPARK_COUNT);
+  const speed = new Float32Array(SPARK_COUNT);
+  const drift = new Float32Array(SPARK_COUNT * 2);
+  let s = 5077;
+  const rng = () => {
+    s = (s * 1664525 + 1013904223) >>> 0;
+    return s / 4294967296;
+  };
+  for (let i = 0; i < SPARK_COUNT; i++) {
+    const r = Math.sqrt(rng()) * 0.16;      // column radius
+    const a = rng() * Math.PI * 2;
+    pos[i * 3] = Math.cos(a) * r;
+    pos[i * 3 + 1] = -0.6 + rng() * 0.8;    // spawn low, around the feather base
+    pos[i * 3 + 2] = -0.3 + Math.sin(a) * r;
+    birth[i] = rng() * 2.2;
+    size[i] = rng() * 0.05;
+    opac[i] = 0.4 + rng() * 0.6;
+    speed[i] = 0.8 + rng() * 0.7;           // brisk, all upward: one current
+    drift[i * 2] = (rng() - 0.5) * 0.08;    // barely any sideways wander
+    drift[i * 2 + 1] = (rng() - 0.5) * 0.08;
+  }
+  sparkGeo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  sparkGeo.setAttribute('aBirthTime', new THREE.BufferAttribute(birth, 1));
+  sparkGeo.setAttribute('aSize', new THREE.BufferAttribute(size, 1));
+  sparkGeo.setAttribute('aRandomOpacity', new THREE.BufferAttribute(opac, 1));
+  sparkGeo.setAttribute('aRandomSpeed', new THREE.BufferAttribute(speed, 1));
+  sparkGeo.setAttribute('aDrift', new THREE.BufferAttribute(drift, 2));
+}
+const sparkMat = new THREE.ShaderMaterial({
+  vertexShader: DUST_VERTEX,
+  fragmentShader: DUST_FRAGMENT,
+  uniforms: {
+    seconds: { value: 0 },
+    lifeTime: { value: 2.2 },
+    speed: { value: 1.6 },
+    baseSize: { value: 0.05 },
+    color: { value: new THREE.Color(0.7, 0.8, 1.12) },
+  },
+  transparent: true,
+  blending: THREE.AdditiveBlending,
+  depthWrite: false,
+});
+const sparks = new THREE.Points(sparkGeo, sparkMat);
+sparks.frustumCulled = false;
+bgScene.add(sparks);
+
 /* ── Cloud planes: the two sim consumers ───────────────────────────────── */
 
 const cloudScene = new THREE.Scene();
@@ -224,15 +283,21 @@ function makeCloud(type: number): THREE.ShaderMaterial {
          collapses them to luminance FIRST so the pink tint shows, and
          factor 6 blooms without clipping to white. */
       color: { value: new THREE.Color(1.0, 0.28, 0.75) },
-      emissionFactor: { value: 6.0 },
-      emissionWhiteness: { value: 0.85 },
+      emissionFactor: { value: 4.5 },
+      /* Lower whiteness now that the shader maps each delta channel to its
+         own colour (magenta/violet/cyan): the chromatic fringing IS the
+         reference look; whiteness only blends back toward the flat tint. */
+      emissionWhiteness: { value: 0.35 },
       interpol: { value: 0.5 },
       type: { value: type },
       blueness: { value: 0.28 },
-      opacity: { value: type < 1 ? 1.0 : 0.85 },
+      /* The ripple quad REDRAWS the background over the disc: at 0.85 it
+         was erasing 85% of the filaments under it. It only needs enough
+         presence for the cursor shimmer. */
+      opacity: { value: type < 1 ? 1.0 : 0.4 },
       simpleTexel: { value: new THREE.Vector2(1 / RIPPLE_SIM_SIZE, 1 / RIPPLE_SIM_SIZE) },
       // Subtle heat-haze, not a lens blob.
-      hazeScale: { value: type < 1 ? 0.02 : 0.05 },
+      hazeScale: { value: type < 1 ? 0.02 : 0.03 },
     },
     transparent: true,
     depthWrite: false,
@@ -241,10 +306,31 @@ function makeCloud(type: number): THREE.ShaderMaterial {
 }
 const fluidCloudMat = makeCloud(0);
 const rippleCloudMat = makeCloud(1);
-cloudScene.add(new THREE.Mesh(new THREE.PlaneGeometry(2, 2), fluidCloudMat));
+
+/* The fluid no longer lives on a fullscreen overlay. It is a big TILTED
+   DISC in the 3D scene, rendered with the main camera — that perspective
+   is what makes the filaments read as the reference's receding ellipse
+   around the feather instead of flat wallpaper. The ripple consumer stays
+   fullscreen: it is a screen-space cursor shimmer by nature. */
+const discScene = new THREE.Scene();
+const fluidDisc = new THREE.Mesh(new THREE.PlaneGeometry(11, 8), fluidCloudMat);
+fluidDisc.rotation.x = -1.02; // leaning back: floor-like, elliptical in view
+fluidDisc.position.set(0, -0.2, -0.4);
+fluidDisc.frustumCulled = false;
+discScene.add(fluidDisc);
+
 const rippleCloudMesh = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), rippleCloudMat);
 rippleCloudMesh.renderOrder = 1;
 cloudScene.add(rippleCloudMesh);
+
+/* Spawner camera: an orthographic camera PARENTED TO THE DISC, looking
+   straight down the disc's normal with a frustum equal to the disc's own
+   half-extents. Its render is therefore pixel-aligned with the disc's UV
+   space — exactly what the FluidSpawner pass needs. (The old version
+   rendered from the main camera, which only matched a fullscreen fluid.) */
+const spawnerCam = new THREE.OrthographicCamera(-5.5, 5.5, 4, -4, 0.1, 12);
+spawnerCam.position.set(0, 0, 6);
+fluidDisc.add(spawnerCam);
 
 /* ── Blit helper (copy a texture into a target, no overscan) ───────────── */
 
@@ -347,24 +433,30 @@ gltf.load('/models/feather.glb', (g) => {
       iorDelta: { value: 0.909 },
       uvShiftFactor: { value: 2.11 },
       useTransmittance: { value: 1 },
-      fringeMix: { value: 0.86 },
+      /* 0.86 white rim swallowed the whole silhouette — the washed-out
+         white feather. The rim should be an accent over the glass, not
+         the glass. */
+      fringeMix: { value: 0.42 },
       fringeCurve: { value: 4.08 },
       fringeColor: { value: new THREE.Color(0.95, 0.97, 1.0) },
       colorBoost: { value: 2 },
-      decayFactor: { value: 20 },
-      reflectionIridescence: { value: 0.28 },
-      colorFactor: { value: 2 },
-      colorCurve: { value: 1.34 },
+      // 20 killed the interior tint entirely (exp(-20t) ~ 0 everywhere).
+      decayFactor: { value: 9 },
+      // The rainbow facet sparkle lives here: it scales the iridescence
+      // LUT on the env reflection. 0.28 was barely visible.
+      reflectionIridescence: { value: 0.85 },
+      colorFactor: { value: 1.45 },
+      colorCurve: { value: 1.1 },
       colorCurveR: { value: 1 },
       colorCurveG: { value: 1 },
       colorCurveB: { value: 1 },
       envReflection: { value: 1.6 },
-      maxColorValue: { value: 100 },
+      maxColorValue: { value: 5 },  // 100 nukes the bloom chain into one white blob
       distancesFactor: { value: thicknessScale },
       resetDistances: { value: 0 },
       peaksFactor: { value: 2.45 },
-      baseColor: { value: new THREE.Color(0.85, 0.78, 1.0) },
-      peaksColor: { value: new THREE.Color(1.0, 0.85, 1.0) },
+      baseColor: { value: new THREE.Color(0.72, 0.58, 1.0) },
+      peaksColor: { value: new THREE.Color(1.0, 0.75, 1.0) },
     },
   });
   featherMesh = new THREE.Mesh(geo, glassMat);
@@ -377,12 +469,23 @@ gltf.load('/models/feather.glb', (g) => {
 /* ── Pointer ───────────────────────────────────────────────────────────── */
 
 const pointerNow = new THREE.Vector2(0.5, 0.5);
-window.addEventListener('pointermove', (e) => {
-  const x = e.clientX / window.innerWidth;
-  const y = 1 - e.clientY / window.innerHeight;
+const raycaster = new THREE.Raycaster();
+const ndc = new THREE.Vector2();
+
+/* The fluid's UV space is the DISC's UV space now, so the cursor must be
+   raycast onto the disc. One subtlety: the scene renders with 25% overscan
+   (clip.xy /= 1.25) and the composite zooms back in, so a visible screen
+   point corresponds to NDC * 1.25 in raw camera space. */
+function feedPointer(x: number, y: number): void {
   pointerNow.set(x, y);
-  fluid.setPointer(x, y);
-  ripple.setPointer(x, y);
+  ripple.setPointer(x, y); // ripple stays screen-space
+  ndc.set((x * 2 - 1) * 1.25, (y * 2 - 1) * 1.25);
+  raycaster.setFromCamera(ndc, camera);
+  const hit = raycaster.intersectObject(fluidDisc, false)[0];
+  if (hit && hit.uv) fluid.setPointer(hit.uv.x, hit.uv.y);
+}
+window.addEventListener('pointermove', (e) => {
+  feedPointer(e.clientX / window.innerWidth, 1 - e.clientY / window.innerHeight);
 });
 
 // Cursor ring (DOM), eased in dt so it feels identical at any refresh rate.
@@ -402,6 +505,36 @@ const INTRO_SPLATS: [number, number, number, number, number][] = [
   [2.0, 0.38, 0.6, 0.003, 0.002],
 ];
 let nextSplat = 0;
+
+/* Ember churn: the reference's disc is COVERED in filaments even when the
+   mouse is idle, because the scene keeps stirring its own fluid. Three
+   invisible emitters orbit the disc centre on incommensurate periods and
+   drag capsule splats behind them every frame — a continuous, non-repeating
+   stir that keeps the whole disc etched. (In disc-UV space; impulses run
+   through the same MAX_IMPULSE cap as the mouse.) */
+const EMBERS = [
+  { r: 0.13, rv: 0.6, w: 0.5, p: 0.0 },
+  { r: 0.24, rv: 0.55, w: -0.37, p: 2.1 },
+  { r: 0.36, rv: 0.5, w: 0.26, p: 4.4 },
+  { r: 0.44, rv: 0.45, w: -0.19, p: 1.2 },
+];
+const emberPrev = EMBERS.map(() => new THREE.Vector2(-1, -1));
+function stirEmbers(seconds: number): void {
+  for (let i = 0; i < EMBERS.length; i++) {
+    const e = EMBERS[i];
+    const a = seconds * e.w * Math.PI * 2 * 0.15 + e.p;
+    const wobble = 1 + 0.25 * Math.sin(seconds * 0.9 + e.p * 3.1);
+    const x = 0.5 + Math.cos(a) * e.r * wobble;
+    const y = 0.5 + Math.sin(a) * e.r * e.rv * wobble;
+    const prev = emberPrev[i];
+    if (prev.x >= 0) {
+      const dx = x - prev.x;
+      const dy = y - prev.y;
+      if (Math.hypot(dx, dy) > 1e-5) fluid.splatAt(x, y, dx, dy);
+    }
+    prev.set(x, y);
+  }
+}
 
 /* ── Resize ────────────────────────────────────────────────────────────── */
 
@@ -446,7 +579,8 @@ function frame(): void {
     fluid.splatAt(x, y, dx, dy);
   }
 
-  // 1. Spawner silhouette: the feather, flat white, from the main camera.
+  // 1. Spawner silhouette: the feather, flat white, rendered from the
+  //    disc-aligned ortho camera so the footprint lands in disc-UV space.
   let spawnerTex: THREE.Texture | null = null;
   if (featherMesh) {
     const prev = featherMesh.material;
@@ -454,13 +588,13 @@ function frame(): void {
     renderer.setRenderTarget(spawnerRT);
     renderer.setClearColor(0x000000, 1);
     renderer.clear(true, true, false);
-    renderer.render(featherScene, camera);
+    renderer.render(featherScene, spawnerCam);
     featherMesh.material = prev;
     spawnerTex = spawnerRT.texture;
   }
 
-  // 2. Simulations. The spawner breathes on a slow cycle instead of
-  //    injecting a constant stream.
+  // 2. Simulations. The spawner breathes; the embers stir continuously.
+  stirEmbers(seconds);
   const breath = 0.7 + 0.3 * Math.sin(seconds * 0.5);
   fluid.step(spawnerTex, SPAWN_VELOCITY * breath * dt * 60, SPAWN_DENSITY * breath * dt * 60);
   ripple.step(seconds);
@@ -468,6 +602,7 @@ function frame(): void {
   // 3. Background -> rtA.
   bgMat.uniforms.seconds.value = seconds;
   dustMat.uniforms.seconds.value = seconds;
+  sparkMat.uniforms.seconds.value = seconds;
   renderer.setRenderTarget(rtA);
   renderer.clear(true, true, false);
   renderer.render(bgScene, camera);
@@ -482,9 +617,10 @@ function frame(): void {
   fluidCloudMat.uniforms.map.value = rtA.texture;
   rippleCloudMat.uniforms.simpleMap.value = ripple.texture;
   rippleCloudMat.uniforms.map.value = rtA.texture;
-  fluidCloudMat.visible = SHOW.fluidCloud;
+  fluidDisc.visible = SHOW.fluidCloud;
   rippleCloudMesh.visible = SHOW.rippleCloud;
-  renderer.render(cloudScene, blitCam);
+  renderer.render(discScene, camera);   // the tilted disc, in perspective
+  renderer.render(cloudScene, blitCam); // the fullscreen ripple shimmer
 
   // 5. rtBG + feather -> rtFinal.
   blitMat.uniforms.map.value = rtBG.texture;
@@ -492,6 +628,12 @@ function frame(): void {
   renderer.clear(true, true, false);
   renderer.render(blitScene, blitCam);
   if (featherMesh && glassMat && SHOW.feather) {
+    /* The reference feather is never still: a slow continuous turn plus a
+       breathing bob. The turn is what makes the dispersion and env
+       reflection LIVE — every facet sweeps through the bright core and the
+       iridescence LUT as it rotates. */
+    featherMesh.rotation.y = seconds * 0.45;
+    featherMesh.position.y = 0.15 + Math.sin(seconds * 0.6) * 0.05;
     glassMat.uniforms.map.value = rtBG.texture;
     glassMat.uniforms.seconds.value = seconds;
     renderer.render(featherScene, camera);
@@ -524,11 +666,7 @@ window.__hero = {
   splat: (x, y, dx, dy) => fluid.splatAt(x, y, dx, dy),
   // Scripted pointer path for the verification harness: exactly what a
   // real pointermove feeds, including the first-event edge case.
-  pointer: (x, y) => {
-    pointerNow.set(x, y);
-    fluid.setPointer(x, y);
-    ripple.setPointer(x, y);
-  },
+  pointer: (x, y) => feedPointer(x, y),
   stats: () => ({
     dpr: DPR,
     fluidPixels: FLUID_PIXELS,

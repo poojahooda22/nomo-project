@@ -43,7 +43,7 @@ const MAX_IMPULSE = 0.006;
    clips for seconds, and a clipped interior is FLAT - the edge detector
    then finds nothing but the outer border, drawing one fat blob instead
    of wire-thin filaments. */
-const DYE_STAMP_SCALE = 0.12;
+const DYE_STAMP_SCALE = 0.3;
 
 interface PingPong {
   read: THREE.WebGLRenderTarget;

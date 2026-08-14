@@ -29,11 +29,12 @@ export function makeColorsLUT(): THREE.CanvasTexture {
       img.data[x * 4 + 2] = c[2];
       img.data[x * 4 + 3] = 255;
 
-      /* Row 1 — thin-film pastel: phase-shifted sinusoids around a high
-         base so it tints without darkening. */
-      const r = 0.75 + 0.25 * Math.sin(t * Math.PI * 4.0);
-      const g = 0.75 + 0.25 * Math.sin(t * Math.PI * 4.0 + 2.1);
-      const b = 0.75 + 0.25 * Math.sin(t * Math.PI * 4.0 + 4.2);
+      /* Row 1 — thin-film iridescence: phase-shifted sinusoids. Deeper
+         amplitude than a pastel so the facet colours actually read as
+         rainbow sparkle on the rotating glass, not a faint tint. */
+      const r = 0.62 + 0.38 * Math.sin(t * Math.PI * 4.0);
+      const g = 0.62 + 0.38 * Math.sin(t * Math.PI * 4.0 + 2.1);
+      const b = 0.62 + 0.38 * Math.sin(t * Math.PI * 4.0 + 4.2);
       const i = (w + x) * 4;
       img.data[i] = Math.round(r * 255);
       img.data[i + 1] = Math.round(g * 255);

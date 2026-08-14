@@ -137,8 +137,8 @@ export class PostChain {
       fragmentShader: THRESHOLD_FRAG,
       uniforms: {
         map: { value: null },
-        threshold: { value: 1.0 },
-        softWidth: { value: 0.25 },
+        threshold: { value: 1.05 },
+        softWidth: { value: 0.12 },
       },
       depthTest: false,
       depthWrite: false,
@@ -164,7 +164,7 @@ export class PostChain {
         bloomLevel3: { value: null },
         bloomLevel4: { value: null },
         bloomRadius: { value: 0.67 },
-        bloomPower: { value: 0.17 },
+        bloomPower: { value: 0.12 },
         haloShift: { value: 0.0 },
         /* The halo pass splits R/G from B by 12.5 texels: R+G without B is
            yellow, printing ghost arcs near the frame edges. The reference

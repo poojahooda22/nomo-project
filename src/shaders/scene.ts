@@ -33,8 +33,13 @@ void main() {
   col += vec3(0.025, 0.04, 0.125) * column;
   // A bright core directly behind the feather: this is what the glass
   // refracts and disperses. Without it the dispersion has nothing to bend.
+  /* Tight and modest. sRGB output LIFTS the darks: a linear 0.2 displays
+     as ~0.5, so a wide gaussian at amplitude 1.2 reads as a giant white
+     ellipse swallowing half the frame (it did). The glass only needs a
+     hot SMALL core to disperse; the width comes from bloom, not from the
+     background. */
   vec2 cv = (vUv - vec2(0.5, 0.5)) * vec2(2.2, 1.1);
-  col += vec3(0.5, 0.62, 1.2) * exp(-16. * dot(cv, cv));
+  col += vec3(0.34, 0.42, 0.95) * exp(-60. * dot(cv, cv));
   gl_FragColor = vec4(col, 1.);
 }
 `;
@@ -44,21 +49,29 @@ void main() {
    dye's edge filaments. type 1: ripple mode — slope-based refraction and
    blue tint hugging the cursor. */
 
+/* Full model/view/projection transform so the SAME shader serves both the
+   tilted 3D fluid disc (rendered with the main camera — this is what turns
+   the fluid into the reference's receding ellipse instead of a flat
+   screen overlay) and the fullscreen ripple quad (rendered with a default
+   Camera whose matrices are identity, so it degenerates to a screen quad).
+   The clip position is passed whole and divided per-fragment: interpolating
+   an already-divided screen UV across a perspective-tilted plane warps it. */
 export const CLOUD_VERTEX = /* glsl */ `
 varying vec2 vUv;
-varying vec2 vScreenUv;
+varying vec4 vClip;
 void main() {
   vUv = uv;
-  gl_Position = vec4(position.xy, 0., 1.);
-  gl_Position.xy /= ${OVERSCAN};
-  vScreenUv = gl_Position.xy * 0.5 + 0.5;
+  vec4 clip = projectionMatrix * modelViewMatrix * vec4(position, 1.);
+  clip.xy /= ${OVERSCAN};
+  gl_Position = clip;
+  vClip = clip;
 }
 `;
 
 export const CLOUD_FRAGMENT = /* glsl */ `
 precision highp float;
 varying vec2 vUv;
-varying vec2 vScreenUv;
+varying vec4 vClip;
 uniform sampler2D normalMap;
 uniform sampler2D deltaMap;
 uniform sampler2D map;
@@ -95,14 +108,24 @@ void main() {
     offset = slope * hazeScale * 4.;
   }
 
+  vec2 vScreenUv = vClip.xy / vClip.w * 0.5 + 0.5;
   vec2 uv = vScreenUv + offset;
   vec3 final = texture2D(map, uv).rgb;
 
   if (type < 1.) {
     vec3 emi = texture2D(deltaMap, vUv).xyz;
     float luminance = dot(emi, vec3(0.2126, 0.7152, 0.0722));
-    emi = mix(emi, vec3(luminance), emissionWhiteness);
-    final += emi * emissionFactor * color * (1. - type);
+    /* The delta channels are |d normal.x|, |d normal.y|, |d normal.z| —
+       three DIFFERENT edge measurements that peak at slightly different
+       places along a filament. Giving each its own colour is what draws
+       the reference's chromatic fringing (magenta core, violet body, cyan
+       rim) instead of one flat tint. emissionWhiteness blends toward the
+       flat "color" tint for art-direction control. */
+    vec3 chroma = emi.r * vec3(1.0, 0.25, 0.85)
+                + emi.g * vec3(0.55, 0.35, 1.0)
+                + emi.b * vec3(0.3, 0.65, 1.0);
+    vec3 emiCol = mix(chroma, luminance * color, emissionWhiteness);
+    final += emiCol * emissionFactor * (1. - type);
   }
 
   if (type > 0.) {
