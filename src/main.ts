@@ -141,15 +141,14 @@ const beamMat = new THREE.ShaderMaterial({
   vertexShader: BEAM_VERTEX,
   fragmentShader: BEAM_FRAGMENT,
   uniforms: {
-    /* Deep saturated blue at moderate intensity. At 3.2 the layered
-       planes stacked past 1.0 where the tonemapper desaturates toward
-       white; the reference beam stays blue along its whole length. */
-    /* Same linear-vs-sRGB trap as the background lobes: 0.42 green in
-       linear displays as two-thirds of blue, i.e. a steel-white column.
-       The reference beam is saturated blue along its whole length. */
-    color: { value: new THREE.Color(0.10, 0.22, 1.0) },
-    intensity: { value: 2.4 },
-    falloff: { value: 0.5 },
+    /* Slim, saturated, and DYING before the blade. In the reference the
+       beam is a thin bright line from the top of frame that fades out just
+       above the feather tip; nothing white ever lies over the blade. Keep
+       green under a quarter of blue (sRGB doubles the displayed ratio) and
+       let falloff 0.85 extinguish the column before it reaches the glass. */
+    color: { value: new THREE.Color(0.10, 0.20, 1.0) },
+    intensity: { value: 2.0 },
+    falloff: { value: 0.85 },
     opacity: { value: 0.05 },
   },
   transparent: true,
@@ -209,6 +208,9 @@ const dustMat = new THREE.ShaderMaterial({
     lifeTime: { value: 2.5 },
     speed: { value: 0.5 },
     baseSize: { value: 0.04 },
+    // Ambient dust keeps its straight linear drift, unchanged.
+    wanderAmp: { value: 0.0 },
+    wanderFreq: { value: 0.0 },
     color: { value: new THREE.Color(0.65, 0.75, 1.0) },
   },
   transparent: true,
@@ -264,7 +266,14 @@ const sparkMat = new THREE.ShaderMaterial({
     lifeTime: { value: 2.2 },
     speed: { value: 1.6 },
     baseSize: { value: 0.05 },
-    color: { value: new THREE.Color(0.7, 0.8, 1.12) },
+    /* The zigzag: roughly two and a half lateral swings over a mote's
+       2.2s life, wide enough to read as a wandering path rather than a
+       ruled line, tight enough to stay inside the beam column. */
+    wanderAmp: { value: 0.16 },
+    wanderFreq: { value: 15.0 },
+    /* Sub-HDR: at 1.12 the spark motes crossed the bloom threshold and
+       smeared a white plume up the beam column, over the blade. */
+    color: { value: new THREE.Color(0.30, 0.42, 0.95) },
   },
   transparent: true,
   blending: THREE.AdditiveBlending,

@@ -22,86 +22,63 @@ export const BG_FRAGMENT = /* glsl */ `
 precision highp float;
 varying vec2 vUv;
 uniform float seconds;
+
+/* THE BLUE CIRCLE, as one legible radial profile.
+ *
+ * Geometry: everything is a function of ONE distance d from the glow
+ * centre (0.5, 0.47) in aspect-corrected UV, so the glow is a true circle
+ * that cannot smear into an ellipse or a shaft. There are no elongated
+ * lobes, no vertical bands, and nothing near-neutral anywhere in this
+ * shader - the beam is separate slim geometry in the scene.
+ *
+ * Radial budget (fractions are of the glow radius R = 0.62 UV, which the
+ * composite's 1.25 un-zoom shows as about 55-60 percent of frame height -
+ * measure the reference and that is the figure you get):
+ *   d = 0.00        bright royal core behind the blade
+ *   d = 0.35 R      half the core brightness
+ *   d = 1.00 R      under a tenth - the visible edge of the circle
+ *   beyond          the deep floor, then black corners
+ *
+ * Colour: the ratios are set for what they DISPLAY as, not what they read
+ * as. sRGB compresses ratios, so to SHOW green at a quarter of blue (the
+ * reference's halo, one eyedropper away) the shader must FEED green near
+ * blue/18 and red near blue/25. Every term below obeys r <= b/14,
+ * g <= b/9. If any future edit adds a glow with more red or green than
+ * that, it will read whitish - that exact mistake has been made and
+ * reverted three times in this file's history. */
 void main() {
-  vec2 c = vUv - vec2(0.5, 0.55);
-  float r = length(c * vec2(1.6, 1.));
-  // The reference frame is near-black away from the beam.
-  vec3 deep = vec3(0.0006, 0.0008, 0.0040);
-  vec3 pool = vec3(0.0015, 0.0030, 0.0160);
-  vec3 col = mix(pool, deep, smoothstep(0.05, 0.85, r));
-  float column = exp(-10. * abs(vUv.x - 0.5)) * smoothstep(0.0, 0.55, vUv.y);
-  col += vec3(0.006, 0.014, 0.070) * column;
-  // A bright core directly behind the feather: this is what the glass
-  // refracts and disperses. Without it the dispersion has nothing to bend.
-  /* Tight and modest. sRGB output LIFTS the darks: a linear 0.2 displays
-     as ~0.5, so a wide gaussian at amplitude 1.2 reads as a giant white
-     ellipse swallowing half the frame (it did). The glass only needs a
-     hot SMALL core to disperse; the width comes from bloom, not from the
-     background. */
-  /* Aspect-corrected so the halo is a CIRCLE. The old (2.2, 1.1) scaling
-     stretched it into a lens twice as wide as tall, which is why widening
-     it flooded the top corners with navy instead of pooling around the
-     asset the way the reference does. */
-  vec2 cv = (vUv - vec2(0.5, 0.47)) * vec2(1.76, 1.1);
+  /* Aspect-corrected offset from the glow centre. 1.6 is the design
+     aspect; at other window shapes the circle stays a circle because both
+     axes use the same UV frame the composite un-zooms. */
+  vec2 cv = (vUv - vec2(0.5, 0.47)) * vec2(1.6, 1.0);
   float d2 = dot(cv, cv);
-  /* THREE lobes, not one. The previous single tight gaussian is why the
-     reference's big soft blue disc around the asset was missing entirely.
-     The reason the old WIDE gaussian had to be deleted was not its width,
-     it was its RED: sRGB lifts the darks, so a wide lobe with r ~ g ~ b
-     reads as a white ellipse. Keep the wide lobes strongly blue-dominant
-     (r about 1/8 of b) and they read as blue haze at any amplitude. */
-  /* SATURATION IS SET IN LINEAR, READ IN sRGB - and the gap between the
-     two is the whole "whitish center" bug. sRGB compresses ratios: a
-     linear g/b of 1/4 (what these lobes used to be) displays as g/b of
-     about 1/2 - the pale steel-blue wash. The reference's halo shows
-     g/b about 1/4 ON SCREEN, which back through the gamma curve means
-     green must sit near b/18 and red near b/25 IN THE SHADER. That is
-     what these amplitudes are. If it ever drifts pale again, the test
-     is one eyedropper away: sRGB green must stay near a QUARTER of
-     blue right next to the blade. */
-  col += vec3(0.010, 0.018, 0.230) * exp(-2.3  * d2);   // outer blue disc
-  col += vec3(0.022, 0.042, 0.460) * exp(-7.5  * d2);   // inner blue bloom
 
-  /* The backlight the feather actually refracts, and the reason it was a
-     flat blue crystal. The glass is a lens: whatever is behind it is what
-     it shows, and colorBoost 1.55 then SATURATES that. With only a blue
-     halo behind it, a blue-dominant sample gets its red crushed toward
-     zero and the feather can be nothing but blue. The reference has a hot
-     near-white shaft standing behind the asset, so the taps come back
-     bright and near-neutral and the dispersion palette + glass tint are
-     free to colour them. Elongated on Y so it backs the whole blade, not
-     just its middle. */
-  vec2 hv = (vUv - vec2(0.5, 0.47)) * vec2(24.0, 2.5);
-  /* The shaft comes DOWN and dies at the blade's base - in the reference
-     nothing is lit below the asset. Without this cutoff it ran straight
-     off the bottom of the frame as a second beam.
+  /* The floor: corners are BLACK. Not navy - black with the faintest blue
+     cast so the fluid's dark gaps still read as night rather than void. */
+  vec3 col = vec3(0.00006, 0.00008, 0.00080);
 
-     SATURATED blue, never near-neutral. The tonemapper desaturates any
-     overbright pixel toward white and sRGB lifts the mids, so a neutral
-     shaft here reads as white fog poured over the blade - the reference
-     frame has no white anywhere except the beam's very core. Keep red
-     near an eighth of blue and the shaft stays a blue glow at any
-     amplitude. The glass no longer needs neutral light behind it: its
-     sparkle comes from the fringe, the iridescence LUT and the env map. */
-  float shaftFade = smoothstep(0.16, 0.40, vUv.y);
-  col += vec3(0.020, 0.045, 0.360) * exp(-dot(hv, hv)) * shaftFade;
-  col += vec3(0.014, 0.030, 0.240) * exp(-22.0 * d2);   // its soft spill
+  /* The circle. Three concentric gaussians of one hue family, exponents
+     chosen so the glow has ENDED by half a frame from centre:
+       exp(-24 d2): the core right behind the blade (its backlight)
+       exp(-10 d2): the body of the circle
+       exp(- 8.0 d2): the last soft skirt. NOTE the overscan: the
+                      composite un-zoom means a screen corner sits at only
+                      d2 of about 0.5 in this shader's UV, not 1.0 - so
+                      the skirt must already be dead at d2 = 0.5
+                      (exp(-4) = 0.018 of a small amplitude). The old
+                      outer lobe used exp(-2.3 d2) at 6x this amplitude,
+                      still 40 percent alive at the corners - that single
+                      number was the blue-flooded canvas. */
+  col += vec3(0.0016, 0.0034, 0.042) * exp(-9.5 * d2);
+  col += vec3(0.0090, 0.0180, 0.230) * exp(-10.0 * d2);
+  col += vec3(0.0220, 0.0420, 0.520) * exp(-24.0 * d2);
 
-  /* A HIDDEN near-neutral filament for the glass, not for the eye. The
-     feather is a lens: kill every neutral light behind it and its five
-     refraction taps can only return blue, so the blade flattens to indigo.
-     But paint that light visibly and the halo goes white again - the very
-     bug being fixed. The resolution is width: this band is narrower than
-     the blade itself (about 2/3 of its on-screen width), so the feather's
-     body OCCLUDES it completely; only the refraction taps, which sample
-     the scene where the ray EXITS the glass, ever read it. Same fade as
-     the shaft so nothing neutral survives below the blade's base. */
-  /* The near-neutral "hidden backlight" that used to sit here is DELETED.
-     It was premised on the blade occluding it; rendering with the feather
-     switched off proved otherwise - it was the whitish flame itself, and
-     the brightest thing in frame. Nothing near-neutral may live in the
-     background: the glass gets its colour from its own fringe, the
-     iridescence LUT and the env map instead. */
+  /* The beam's landing glow: a SMALL brightening where the beam meets the
+     blade tip, so the slim beam geometry does not look pasted on. Tight
+     (exp(-90)) and the same hue family - this is NOT a shaft. */
+  vec2 tv = (vUv - vec2(0.5, 0.60)) * vec2(1.6, 1.0);
+  col += vec3(0.0140, 0.0300, 0.340) * exp(-90.0 * dot(tv, tv));
+
   gl_FragColor = vec4(col, 1.);
 }
 `;
@@ -252,6 +229,7 @@ export const DUST_VERTEX = /* glsl */ `
 attribute float aBirthTime, aSize, aRandomOpacity, aRandomSpeed;
 attribute vec2 aDrift;
 uniform float seconds, lifeTime, speed, baseSize;
+uniform float wanderAmp, wanderFreq;
 varying float vOpacity;
 void main() {
   float localTime = mod(seconds + aBirthTime, lifeTime);
@@ -259,6 +237,20 @@ void main() {
   vec3 pos = position;
   pos.y  += progress * speed * aRandomSpeed;
   pos.xz += aDrift * progress;
+
+  /* Serpentine wander. aDrift alone is a LINEAR offset, so a mote can only
+     ever travel in a straight line from where it spawned - which is why the
+     rising sparks read as ruled pencil strokes. Two out-of-phase sines on x
+     and z bend that line into a climbing zigzag. The rate is scaled per
+     particle (aRandomOpacity is already a stable 0.4-1.0 per-mote random)
+     so they never oscillate in lockstep, and the amplitude grows with
+     progress so each spark leaves its source cleanly and widens as it
+     rises. wanderAmp is 0 for the ambient dust, which is unchanged. */
+  float ph = aBirthTime * 9.7;
+  float rate = wanderFreq * (0.7 + aRandomOpacity * 0.6);
+  float sway = wanderAmp * progress;
+  pos.x += sin(progress * rate + ph) * sway;
+  pos.z += cos(progress * rate * 0.8 + ph * 1.6) * sway * 0.7;
   vOpacity = smoothstep(0., 0.1, progress) * (1. - smoothstep(0.8, 1., progress));
   vOpacity *= aRandomOpacity;
   vec4 mvPosition = modelViewMatrix * vec4(pos, 1.);
