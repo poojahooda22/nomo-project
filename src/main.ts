@@ -7,7 +7,7 @@ import { FluidSim } from './FluidSim';
 import { RippleSim, RIPPLE_SIM_SIZE } from './RippleSim';
 import { PostChain } from './PostChain';
 import { makeColorsLUT } from './lut';
-import { GLASS_FRAGMENT, GLASS_VERTEX } from './shaders/glass';
+import { GLASS_BACK_FRAGMENT, GLASS_BACK_VERTEX, GLASS_FRAGMENT, GLASS_VERTEX } from './shaders/glass';
 import {
   BEAM_FRAGMENT,
   BEAM_VERTEX,
@@ -46,8 +46,12 @@ const FLUID_PIXELS = LITE ? 2 ** 16 : 2 ** 18;
    injection / 0.01, so 1.6 here meant a plume velocity near 160, a
    permanently over-driven convection cell. These keep the idle plume
    alive but breathing. */
-const SPAWN_VELOCITY = 0.07;
-const SPAWN_DENSITY = 0.024;
+/* Near-silent. The reference's idle hero is CLEAN - a blue gradient, the
+   feather, nothing else - so the exhale is kept just strong enough that the
+   beam column stays faintly alive, far below filament-forming strength.
+   Every visible filament should be one the cursor drew. */
+const SPAWN_VELOCITY = 0.022;
+const SPAWN_DENSITY = 0.006;
 
 // Layer isolation switches: how the artifacts above were pinned down.
 const SHOW = {
@@ -108,6 +112,7 @@ function makeSceneTarget(): THREE.WebGLRenderTarget {
 }
 let rtA = makeSceneTarget();
 let rtBG = makeSceneTarget();
+let rtBack = makeSceneTarget(); // scene + the feather's BACK-face glass pass
 let rtFinal = makeSceneTarget();
 const spawnerRT = new THREE.WebGLRenderTarget(256, 144, {
   minFilter: THREE.LinearFilter,
@@ -139,7 +144,10 @@ const beamMat = new THREE.ShaderMaterial({
     /* Deep saturated blue at moderate intensity. At 3.2 the layered
        planes stacked past 1.0 where the tonemapper desaturates toward
        white; the reference beam stays blue along its whole length. */
-    color: { value: new THREE.Color(0.3, 0.42, 1.0) },
+    /* Same linear-vs-sRGB trap as the background lobes: 0.42 green in
+       linear displays as two-thirds of blue, i.e. a steel-white column.
+       The reference beam is saturated blue along its whole length. */
+    color: { value: new THREE.Color(0.10, 0.22, 1.0) },
     intensity: { value: 2.4 },
     falloff: { value: 0.5 },
     opacity: { value: 0.05 },
@@ -287,7 +295,7 @@ function makeCloud(type: number): THREE.ShaderMaterial {
          because you asked for more pink and less blue, and that is exactly
          the knob for it: at (1,1,1) the filaments sit at true magenta. */
       color: { value: new THREE.Color(1.0, 0.42, 1.0) },
-      emissionFactor: { value: 3.4 },
+      emissionFactor: { value: 4.2 },
       /* 0.35 was pushing 35% of every filament toward grey. The reference
          runs 0: full channel separation, which is what makes it read pink. */
       emissionWhiteness: { value: 0.0 },
@@ -313,30 +321,33 @@ function makeCloud(type: number): THREE.ShaderMaterial {
 const fluidCloudMat = makeCloud(0);
 const rippleCloudMat = makeCloud(1);
 
-/* The fluid no longer lives on a fullscreen overlay. It is a big TILTED
-   DISC in the 3D scene, rendered with the main camera — that perspective
-   is what makes the filaments read as the reference's receding ellipse
-   around the feather instead of flat wallpaper. The ripple consumer stays
-   fullscreen: it is a screen-space cursor shimmer by nature. */
-const discScene = new THREE.Scene();
-const fluidDisc = new THREE.Mesh(new THREE.PlaneGeometry(11, 8), fluidCloudMat);
-fluidDisc.rotation.x = -1.02; // leaning back: floor-like, elliptical in view
-fluidDisc.position.set(0, -0.2, -0.4);
-fluidDisc.frustumCulled = false;
-discScene.add(fluidDisc);
+/* THE CENTER DEAD-ZONE FIX. The fluid goes back to a FULLSCREEN overlay.
+
+   The tilted-disc experiment is what killed the cursor in the middle of the
+   page. The disc leaned back at -1.02 rad, so the ray through the CENTER of
+   the screen struck it out near its far edge - the region that perspective
+   compresses into a few dozen pixels at the horizon. Your center-screen
+   swirls were being drawn - into a sliver the size of a matchstick, off
+   behind the feather. Only rays through the lower half / sides hit the near
+   part of the disc where UV space is roomy, which is exactly the "works at
+   the corners, dead in the middle" behaviour you saw.
+
+   The reference never does this. Its Water consumer (class dl in the
+   bundle) is a screen quad: one unit of cursor motion is one unit of fluid
+   motion everywhere on the page, center included. The receding-ellipse look
+   in its hero comes from the cloud IMAGERY, not from tilting the sim.
+
+   Rendered with blitCam (identity matrices), CLOUD_VERTEX degenerates to a
+   screen quad with the standard overscan shrink, so vUv == final screen UV
+   and the same shader serves both consumers unchanged. renderOrder keeps
+   the fluid under the ripple shimmer. */
+const fluidCloudMesh = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), fluidCloudMat);
+fluidCloudMesh.renderOrder = 0;
+cloudScene.add(fluidCloudMesh);
 
 const rippleCloudMesh = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), rippleCloudMat);
 rippleCloudMesh.renderOrder = 1;
 cloudScene.add(rippleCloudMesh);
-
-/* Spawner camera: an orthographic camera PARENTED TO THE DISC, looking
-   straight down the disc's normal with a frustum equal to the disc's own
-   half-extents. Its render is therefore pixel-aligned with the disc's UV
-   space — exactly what the FluidSpawner pass needs. (The old version
-   rendered from the main camera, which only matched a fullscreen fluid.) */
-const spawnerCam = new THREE.OrthographicCamera(-5.5, 5.5, 4, -4, 0.1, 12);
-spawnerCam.position.set(0, 0, 6);
-fluidDisc.add(spawnerCam);
 
 /* ── Blit helper (copy a texture into a target, no overscan) ───────────── */
 
@@ -379,6 +390,7 @@ trailScene.add(new THREE.Mesh(new THREE.PlaneGeometry(2, 2), trailMat));
 const featherScene = new THREE.Scene();
 let featherMesh: THREE.Mesh | null = null;
 let glassMat: THREE.ShaderMaterial | null = null;
+let glassBackMat: THREE.ShaderMaterial | null = null;
 const spawnerMaterial = new THREE.ShaderMaterial({
   vertexShader: SPAWNER_VERTEX,
   fragmentShader: SPAWNER_FRAGMENT,
@@ -396,6 +408,7 @@ trailMat.uniforms.noisesMap.value = wavesMap;
 new RGBELoader().load('/textures/wooden_studio_19_1k.hdr', (hdr) => {
   hdr.wrapS = THREE.RepeatWrapping;
   if (glassMat) glassMat.uniforms.envMap.value = hdr;
+  if (glassBackMat) glassBackMat.uniforms.envMap.value = hdr;
   pendingEnv = hdr;
 });
 let pendingEnv: THREE.Texture | null = null;
@@ -427,63 +440,83 @@ gltf.load('/models/feather.glb', (g) => {
   }
   const thicknessScale = 0.3 / maxThickness;
 
+  /* Shared uniform values, all from the reference's settings timeline
+     (timelines/dev.glb - one Blender empty per uniform, xyz = values):
+       Glass_iorVDeltaXshift                  [1.3, 3, 1]
+       Glass_colorBoostFactorCurve            [1.55, 1, 0.95]
+       Glass_fringeCurveMix                   [4, 0.55, 0]
+       Glass_convexConcavePeaks               [0.5, 0.5, 3]
+       Glass_reflectionVIri                   [1, 0.2, 0]   (envReflection, reflectionIridescence)
+       Glass_refractionVIri                   [0.6, 0.15, 0] (envRefraction, refractionIridescence)
+       Glass_colorMaxvalDecayUsetransmittance [50, 20, 1]
+       Glass_colorCurveRGB                    [1.15, 1.2, 1.1]
+       Glass_distResetX                       [0, 1, 0]
+       Glass_color 212,234,255 · Glass_peaksColor 253,208,221 · Glass_fringeColor 243,208,242
+     With the two-pass architecture in place these are used AS-IS - no more
+     compensating (the 0.85 iridescence / 2.3 env reflection hacks existed
+     only because the interior pass was missing). */
+  const shared = () => ({
+    map: { value: null as THREE.Texture | null },
+    envMap: { value: pendingEnv },
+    colorsMap: { value: colorsMap },
+    noiseMap: { value: noiseMap },
+    seconds: { value: 0 },
+    iorStart: { value: 1.3 },
+    iorDelta: { value: 3.0 },
+    useTransmittance: { value: 1 },
+    fringeMix: { value: 0.55 },
+    fringeCurve: { value: 4.0 },
+    fringeColor: { value: new THREE.Color(243 / 255, 208 / 255, 242 / 255) },
+    distancesFactor: { value: thicknessScale },
+    resetDistances: { value: 1 }, // constant 0.1 world-unit march, both passes
+    peaksFactor: { value: 3.0 },
+    baseColor: { value: new THREE.Color(212 / 255, 234 / 255, 255 / 255) },
+    peaksColor: { value: new THREE.Color(253 / 255, 208 / 255, 221 / 255) },
+  });
+
+  /* PASS 1 - the interior. Back faces only, reads rtBG (scene without the
+     feather), writes dispersion + refracted warm environment + confetti
+     iridescence into rtBack. This pass is where the peach/cyan/pink lives. */
+  glassBackMat = new THREE.ShaderMaterial({
+    vertexShader: GLASS_BACK_VERTEX,
+    fragmentShader: GLASS_BACK_FRAGMENT,
+    uniforms: {
+      ...shared(),
+      uvShiftFactor: { value: 1.0 },
+      /* Reference is 0.6 - against ITS backdrop: a scene full of bright varied
+         content (sun sprite, crystals, pale Env_background) whose five taps
+         differ enough for the spectrum weights to tint each facet. Our hero
+         behind the blade is a smooth blue gradient, so the taps come back
+         near-identical and the palette normalisation cancels itself. The env
+         term substitutes as the bright base...  */
+      envRefraction: { value: 1.6 },
+      /* ...and the confetti LUT carves that bright base into per-facet hue
+         patches (peach / cyan / pink - the multiplier can only subtract, so
+         it needs the bright base above to bite into). Reference runs 0.15
+         because its tap variance already does most of this. */
+      refractionIridescence: { value: 0.55 },
+    },
+    side: THREE.BackSide,
+    depthTest: false,
+    depthWrite: false,
+  });
+
+  /* PASS 2 - the front surface, reads rtBack (scene WITH the interior). */
   glassMat = new THREE.ShaderMaterial({
     vertexShader: GLASS_VERTEX,
     fragmentShader: GLASS_FRAGMENT,
     uniforms: {
-      map: { value: null },
-      envMap: { value: pendingEnv },
-      colorsMap: { value: colorsMap },
-      noiseMap: { value: noiseMap },
-      seconds: { value: 0 },
-      /* Everything below is lifted from the reference's own settings
-         timeline (timelines/dev.glb), where each uniform is stored as an
-         empty's xyz. No more guessing:
-           Glass_iorVDeltaXshift                  [1.3, 3, 1]
-           Glass_colorBoostFactorCurve            [1.55, 1, 0.95]
-           Glass_fringeCurveMix                   [4, 0.55, 0]
-           Glass_convexConcavePeaks               [0.5, 0.5, 3]
-           Glass_reflectionVIri                   [1, 0.2, 0]
-           Glass_colorMaxvalDecayUsetransmittance [50, 20, 1]
-           Glass_colorCurveRGB                    [1.15, 1.2, 1.1]
-           Glass_distResetX                       [0, 1, 0]
-           Glass_color      212,234,255   Glass_peaksColor 253,208,221
-           Glass_fringeColor 243,208,242
-         The big one is iorDelta 3.0 (this build had 0.909). That is what
-         spreads the five refraction taps far enough apart to actually
-         disperse - at 0.909 all five landed on nearly the same texel, so
-         the feather could only ever be the colour of whatever was behind
-         it, which is why it came out a single flat blue crystal. */
-      iorStart: { value: 1.3 },
-      iorDelta: { value: 3.0 },
-      uvShiftFactor: { value: 1.0 },
-      useTransmittance: { value: 1 },
-      fringeMix: { value: 0.55 },
-      fringeCurve: { value: 4.0 },
-      fringeColor: { value: new THREE.Color(243 / 255, 208 / 255, 242 / 255) },
+      ...shared(),
       colorBoost: { value: 1.55 },
       decayFactor: { value: 20 },
-      /* Reference value is 0.2. Pushed up because this build has no second
-         refraction-iridescence term (Glass_refractionVIri = [0.6, 0.15])
-         to carry facet colour, so all of it has to ride on the reflection. */
-      reflectionIridescence: { value: 0.55 },
-      colorFactor: { value: 1.25 },
+      reflectionIridescence: { value: 0.2 },
+      colorFactor: { value: 1.0 },
       colorCurve: { value: 0.95 },
       colorCurveR: { value: 1.15 },
       colorCurveG: { value: 1.2 },
       colorCurveB: { value: 1.1 },
-      envReflection: { value: 1.5 },
+      envReflection: { value: 1.0 },
       maxColorValue: { value: 50 },
-      /* Glass_distResetX = [0, 1, 0]: the reference runs resetDistances 1,
-         i.e. a CONSTANT thickness of 0.1 world units rather than the baked
-         per-vertex attribute. decayFactor 20 is calibrated against that
-         0.1 - exp(-0.1*20) = 0.135, so the glass tint survives instead of
-         being annihilated the way it was with a 0.3-scaled thickness. */
-      distancesFactor: { value: thicknessScale },
-      resetDistances: { value: 1 },
-      peaksFactor: { value: 3.0 },
-      baseColor: { value: new THREE.Color(212 / 255, 234 / 255, 255 / 255) },
-      peaksColor: { value: new THREE.Color(253 / 255, 208 / 255, 221 / 255) },
     },
   });
   featherMesh = new THREE.Mesh(geo, glassMat);
@@ -496,20 +529,14 @@ gltf.load('/models/feather.glb', (g) => {
 /* ── Pointer ───────────────────────────────────────────────────────────── */
 
 const pointerNow = new THREE.Vector2(0.5, 0.5);
-const raycaster = new THREE.Raycaster();
-const ndc = new THREE.Vector2();
 
-/* The fluid's UV space is the DISC's UV space now, so the cursor must be
-   raycast onto the disc. One subtlety: the scene renders with 25% overscan
-   (clip.xy /= 1.25) and the composite zooms back in, so a visible screen
-   point corresponds to NDC * 1.25 in raw camera space. */
+/* Screen space in, screen space out. No raycast, no disc, no overscan
+   arithmetic: the fluid UV is the screen UV, so the splat is born exactly
+   under the cursor - center of the page included. */
 function feedPointer(x: number, y: number): void {
   pointerNow.set(x, y);
-  ripple.setPointer(x, y); // ripple stays screen-space
-  ndc.set((x * 2 - 1) * 1.25, (y * 2 - 1) * 1.25);
-  raycaster.setFromCamera(ndc, camera);
-  const hit = raycaster.intersectObject(fluidDisc, false)[0];
-  if (hit && hit.uv) fluid.setPointer(hit.uv.x, hit.uv.y);
+  ripple.setPointer(x, y);
+  fluid.setPointer(x, y);
 }
 window.addEventListener('pointermove', (e) => {
   feedPointer(e.clientX / window.innerWidth, 1 - e.clientY / window.innerHeight);
@@ -533,43 +560,12 @@ const INTRO_SPLATS: [number, number, number, number, number][] = [
 ];
 let nextSplat = 0;
 
-/* Ember churn: the reference's disc is COVERED in filaments even when the
-   mouse is idle, because the scene keeps stirring its own fluid. Three
-   invisible emitters orbit the disc centre on incommensurate periods and
-   drag capsule splats behind them every frame — a continuous, non-repeating
-   stir that keeps the whole disc etched. (In disc-UV space; impulses run
-   through the same MAX_IMPULSE cap as the mouse.) */
-const EMBERS = [
-  /* Two INNER embers orbit tight and fast around the disc centre, so the
-     region under the feather churns as strongly at idle as the outer
-     field does - previously nothing stirred inside r 0.13 and the centre
-     only lit up when the mouse crossed it. Higher angular speed keeps
-     their linear speed (and so their splat strength) comparable to the
-     wide slow orbits. */
-  { r: 0.05, rv: 0.8, w: 0.9, p: 3.3 },
-  { r: 0.09, rv: 0.7, w: -0.7, p: 5.0 },
-  { r: 0.16, rv: 0.6, w: 0.5, p: 0.0 },
-  { r: 0.24, rv: 0.55, w: -0.37, p: 2.1 },
-  { r: 0.33, rv: 0.5, w: 0.26, p: 4.4 },
-  { r: 0.42, rv: 0.45, w: -0.19, p: 1.2 },
-];
-const emberPrev = EMBERS.map(() => new THREE.Vector2(-1, -1));
-function stirEmbers(seconds: number): void {
-  for (let i = 0; i < EMBERS.length; i++) {
-    const e = EMBERS[i];
-    const a = seconds * e.w * Math.PI * 2 * 0.15 + e.p;
-    const wobble = 1 + 0.25 * Math.sin(seconds * 0.9 + e.p * 3.1);
-    const x = 0.5 + Math.cos(a) * e.r * wobble;
-    const y = 0.5 + Math.sin(a) * e.r * e.rv * wobble;
-    const prev = emberPrev[i];
-    if (prev.x >= 0) {
-      const dx = x - prev.x;
-      const dy = y - prev.y;
-      if (Math.hypot(dx, dy) > 1e-5) fluid.splatAt(x, y, dx, dy);
-    }
-    prev.set(x, y);
-  }
-}
+/* The ember churn is GONE. Four invisible emitters were stirring the sim
+   every frame, which is why the field never went quiet: the reference's
+   hero is completely clean until the cursor moves (its idle frame is just
+   the blue gradient and the feather), and every filament on it is one the
+   visitor drew. The fluid now has exactly two inputs: the cursor, and the
+   feather's own faint exhale. */
 
 /* ── Resize ────────────────────────────────────────────────────────────── */
 
@@ -586,9 +582,10 @@ window.addEventListener('resize', () => {
     camera.updateProjectionMatrix();
     fluid.resize(FLUID_PIXELS, w / h);
     ripple.setAspect(w / h);
-    for (const rt of [rtA, rtBG, rtFinal]) rt.dispose();
+    for (const rt of [rtA, rtBG, rtBack, rtFinal]) rt.dispose();
     rtA = makeSceneTarget();
     rtBG = makeSceneTarget();
+    rtBack = makeSceneTarget();
     rtFinal = makeSceneTarget();
     post.resize(Math.round(w * DPR), Math.round(h * DPR));
   });
@@ -614,8 +611,11 @@ function frame(): void {
     fluid.splatAt(x, y, dx, dy);
   }
 
-  // 1. Spawner silhouette: the feather, flat white, rendered from the
-  //    disc-aligned ortho camera so the footprint lands in disc-UV space.
+  // 1. Spawner silhouette: the feather, flat white, rendered from the MAIN
+  //    camera. With the fluid fullscreen again its UV is screen UV, and the
+  //    plain (un-overscanned) SPAWNER_VERTEX projection lands the
+  //    silhouette exactly where the feather sits on the final screen - the
+  //    1.25 shrink at draw time and the 1.25 zoom at composite time cancel.
   let spawnerTex: THREE.Texture | null = null;
   if (featherMesh) {
     const prev = featherMesh.material;
@@ -623,13 +623,12 @@ function frame(): void {
     renderer.setRenderTarget(spawnerRT);
     renderer.setClearColor(0x000000, 1);
     renderer.clear(true, true, false);
-    renderer.render(featherScene, spawnerCam);
+    renderer.render(featherScene, camera);
     featherMesh.material = prev;
     spawnerTex = spawnerRT.texture;
   }
 
   // 2. Simulations. The spawner breathes; the embers stir continuously.
-  stirEmbers(seconds);
   const breath = 0.7 + 0.3 * Math.sin(seconds * 0.5);
   fluid.step(spawnerTex, SPAWN_VELOCITY * breath * dt * 60, SPAWN_DENSITY * breath * dt * 60);
   ripple.step(seconds);
@@ -652,29 +651,43 @@ function frame(): void {
   fluidCloudMat.uniforms.map.value = rtA.texture;
   rippleCloudMat.uniforms.simpleMap.value = ripple.texture;
   rippleCloudMat.uniforms.map.value = rtA.texture;
-  fluidDisc.visible = SHOW.fluidCloud;
+  fluidCloudMesh.visible = SHOW.fluidCloud;
   rippleCloudMesh.visible = SHOW.rippleCloud;
-  renderer.render(discScene, camera);   // the tilted disc, in perspective
-  renderer.render(cloudScene, blitCam); // the fullscreen ripple shimmer
+  renderer.render(cloudScene, blitCam); // fluid + ripple, both screen-space
 
-  // 5. rtBG + feather -> rtFinal.
+  // 5. rtBG + the feather's BACK-face pass -> rtBack. The interior: five
+  //    spectral taps of rtBG plus the warm environment along each refracted
+  //    ray, times the confetti iridescence. The front pass then refracts
+  //    THIS texture - that layering is the reference's holographic blade.
+  if (featherMesh && glassBackMat && SHOW.feather) {
+    featherMesh.rotation.y = seconds * 0.45;
+    featherMesh.position.y = 0.15 + Math.sin(seconds * 0.6) * 0.05;
+  }
   blitMat.uniforms.map.value = rtBG.texture;
+  renderer.setRenderTarget(rtBack);
+  renderer.clear(true, true, false);
+  renderer.render(blitScene, blitCam);
+  if (featherMesh && glassBackMat && SHOW.feather) {
+    const prev = featherMesh.material;
+    featherMesh.material = glassBackMat;
+    glassBackMat.uniforms.map.value = rtBG.texture;
+    glassBackMat.uniforms.seconds.value = seconds;
+    renderer.render(featherScene, camera);
+    featherMesh.material = prev;
+  }
+
+  // 6. rtBack + the feather's FRONT pass -> rtFinal.
+  blitMat.uniforms.map.value = rtBack.texture;
   renderer.setRenderTarget(rtFinal);
   renderer.clear(true, true, false);
   renderer.render(blitScene, blitCam);
   if (featherMesh && glassMat && SHOW.feather) {
-    /* The reference feather is never still: a slow continuous turn plus a
-       breathing bob. The turn is what makes the dispersion and env
-       reflection LIVE — every facet sweeps through the bright core and the
-       iridescence LUT as it rotates. */
-    featherMesh.rotation.y = seconds * 0.45;
-    featherMesh.position.y = 0.15 + Math.sin(seconds * 0.6) * 0.05;
-    glassMat.uniforms.map.value = rtBG.texture;
+    glassMat.uniforms.map.value = rtBack.texture;
     glassMat.uniforms.seconds.value = seconds;
     renderer.render(featherScene, camera);
   }
 
-  // 6. Post to screen, then the trail overlay on top.
+  // 7. Post to screen, then the trail overlay on top.
   if (SHOW.post) {
     post.render(rtFinal, seconds);
   } else {

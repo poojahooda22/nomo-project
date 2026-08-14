@@ -29,10 +29,13 @@ const VELOCITY_DISSIPATION = 0.99;
 /* 0.955 kept dye alive so long that the continuous ember stir built a
    solid carpet edge to edge. The reference field is thin wires over black;
    letting the dye die faster is what re-opens the dark gaps. */
-const DENSITY_DISSIPATION = 0.938;
+const DENSITY_DISSIPATION = 0.968;
 const PRESSURE_DECAY = 0.99;
 const CURL_STRENGTH = 10;
-const SPLAT_RADIUS = 0.0015;
+/* A touch wider than the teardown value: with the idle stir gone the
+   cursor is the only author of the field, and at 0.0015 a single pass
+   left too thin a ribbon to ever grow into the reference's coiling cloud. */
+const SPLAT_RADIUS = 0.0042;
 /* The reference stores this in its settings timeline as Fluid_epsSize.x
    = 0.1 - twenty times larger. It is the amount of the dye gradient that
    gets tilted into the pseudo-normal, so at 0.005 the normal was pinned to
@@ -46,12 +49,12 @@ const DS = 1 / 60;
    The captured reference splat colour for a real downward flick was
    [0, -33.9, 1], i.e. a delta near 0.0034; this ceiling sits just above
    that so a deliberate flick is strong and nothing else can run away. */
-const MAX_IMPULSE = 0.006;
+const MAX_IMPULSE = 0.009;
 /* The dye takes a fraction of the impulse. At full strength the dye field
    clips for seconds, and a clipped interior is FLAT - the edge detector
    then finds nothing but the outer border, drawing one fat blob instead
    of wire-thin filaments. */
-const DYE_STAMP_SCALE = 0.3;
+const DYE_STAMP_SCALE = 0.42;
 
 interface PingPong {
   read: THREE.WebGLRenderTarget;

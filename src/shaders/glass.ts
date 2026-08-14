@@ -1,20 +1,90 @@
 /**
- * The glass feather: hand-written screen-space refraction with spectral
- * dispersion. The view ray is refracted at TWO different IORs, both exit
- * points are reprojected to screen space, and five blue-noise-jittered
- * samples of the scene (rendered without the feather) are taken along the
- * segment between them, each weighted by a spectrum colour from a LUT.
- * Red and violet genuinely exit at different places: chromatic dispersion
- * for the price of five texture taps.
+ * The glass feather - now the reference's actual TWO-PASS architecture,
+ * ported from the shaders in its bundle (`b1` = GlassBack, `x1` = Glass):
  *
- * The mesh carries baked per-vertex _thickness and _peaks attributes.
- * Output is allowed up to 100.0: the HDR sparkle is what feeds the bloom.
+ *   PASS 1 - GlassBack (back faces, reads the scene withOUT the feather):
+ *     five blue-noise-jittered samples between the exit points of two
+ *     refraction rays (iorStart vs iorStart+iorDelta), each weighted by a
+ *     spectrum colour from the LUT, and - THE PIECE OUR PORT WAS MISSING -
+ *     each sample ADDS THE ENVIRONMENT MAP ALONG ITS OWN REFRACTED RAY
+ *     (envRefraction). The env is a warm wooden studio: that refracted
+ *     warmth IS the peach/orange glow inside the reference feather. The
+ *     summed colour is then multiplied by the confetti-iridescence LUT
+ *     (refractionIridescence) - the interior holographic patchwork.
+ *
+ *   PASS 2 - Glass (front faces, reads the scene WITH pass 1 in it):
+ *     a single refraction tap (no loop - the dispersion already happened
+ *     behind), transmittance, fringe, colorBoost, thickness decay tint,
+ *     per-channel colour curves, then env reflection scaled by fresnel and
+ *     the same iridescence LUT (reflectionIridescence).
+ *
+ * A one-pass port cannot fake this: whatever single formula it uses, the
+ * front surface can only show the background - which is now saturated
+ * blue - so the blade could only ever be blue. The interior colour of the
+ * reference literally lives in a second scene texture.
+ *
+ * Uniform values come from the reference's settings timeline
+ * (timelines/dev.glb): Glass_refractionVIri = [0.6, 0.15] is
+ * (envRefraction, refractionIridescence); Glass_reflectionVIri = [1, 0.2]
+ * is (envReflection, reflectionIridescence).
  */
 
-export const GLASS_VERTEX = /* glsl */ `
+const COMMON = /* glsl */ `
+precision highp float;
+
+#define pi 3.141592653589793
+#define saturate1(x) clamp(x, 0., 1.)
+
+uniform sampler2D map;
+uniform sampler2D envMap;
+uniform sampler2D colorsMap;
+uniform sampler2D noiseMap;
+uniform mat4 projectionMatrix;
+uniform float seconds;
+uniform float iorStart;
+uniform float iorDelta;
+uniform float useTransmittance;
+uniform float fringeMix;
+uniform float fringeCurve;
+uniform vec3 fringeColor;
+
+varying vec3 vPosition;
+varying vec3 vNormal;
+varying vec2 vUv;
+varying float vThickness;
+varying vec3 vGlassColor;
+
+/* Reference rolloff is -0.1 (ours was -0.45, which crushed the studio
+   HDR's warm highlights to grey - and the warmth is the whole point). */
+vec3 getEnvColor(vec3 ray) {
+  vec2 uv = vec2(atan(ray.x, ray.z) * 0.5, asin(clamp(ray.y, -1., 1.)));
+  uv = uv * (1. / pi) + 0.5;
+  uv.x = fract(uv.x);
+  return 1. - exp(-0.1 * texture2D(envMap, uv).rgb);
+}
+
+/* v = 0.75 is the confetti row: high-frequency saturated speckle. Facets a
+   few degrees apart land on entirely different hues - that is the
+   holographic patchwork of the reference blade. */
+vec3 getIridescence(vec3 rd, vec3 n) {
+  float thickness = 1. - abs(dot(n, rd));
+  return texture2D(colorsMap, vec2(thickness * 0.3 + 0.08, 0.75)).rgb;
+}
+
+/* v = 0.25 is the dispersion spectrum (dark at both ends). */
+vec3 mixToColor(float t) {
+  return texture2D(colorsMap, vec2(clamp(t, 0.02, 0.98), 0.25)).rgb;
+}
+
+float fresnelSchlick(vec3 rd, vec3 n) {
+  float cosTheta = abs(dot(rd, n));
+  return 0.04 + 0.96 * pow(1. - cosTheta, 5.);
+}
+`;
+
+const VERTEX_BODY = /* glsl */ `
 attribute float _thickness;
 attribute float _peaks;
-attribute vec4 tangent;
 
 uniform float seconds;
 uniform float distancesFactor;
@@ -25,15 +95,10 @@ uniform vec3 peaksColor;
 
 varying vec3 vPosition;
 varying vec3 vNormal;
-varying vec3 vTangent;
-varying vec3 vBitangent;
 varying vec2 vUv;
 varying float vThickness;
 varying vec3 vGlassColor;
 
-/* The source rig was not exported, so the living quality comes from a
-   gentle programmatic sway: a slow bend around Y whose strength grows
-   toward the tip, plus a whole-body bob. */
 mat3 rotY(float a) {
   float c = cos(a), s = sin(a);
   return mat3(c, 0., s, 0., 1., 0., -s, 0., c);
@@ -47,15 +112,17 @@ void main() {
   pos.y += sin(seconds * 0.7) * 0.04;
 
   vec3 n = normalize(bend * normal);
-  vec3 t = normalize(bend * tangent.xyz);
+#ifdef BACK_PASS
+  n = -n;   // reference GlassBack: vNormal = -objectNormal
+#endif
 
   vec4 worldPosition = modelMatrix * vec4(pos, 1.);
   vPosition = worldPosition.xyz;
   vNormal = normalize(mat3(modelMatrix) * n);
-  vTangent = normalize(mat3(modelMatrix) * t);
-  vBitangent = normalize(cross(vNormal, vTangent) * tangent.w);
   vUv = uv;
 
+  /* Glass_distResetX = [0, 1, 0]: resetDistances 1, so the march length is
+     a CONSTANT 0.1 world units in the reference - both passes. */
   vThickness = mix(_thickness * distancesFactor, 0.1, resetDistances);
   vGlassColor = mix(baseColor, peaksColor, clamp(_peaks * peaksFactor, 0., 1.));
 
@@ -64,89 +131,21 @@ void main() {
 }
 `;
 
-export const GLASS_FRAGMENT = /* glsl */ `
-precision highp float;
+export const GLASS_VERTEX = VERTEX_BODY;
+export const GLASS_BACK_VERTEX = '#define BACK_PASS\n' + VERTEX_BODY;
 
-#define pi 3.141592653589793
+/* ── PASS 1: dispersion + refracted environment, on the back faces ────── */
+
+export const GLASS_BACK_FRAGMENT = COMMON + /* glsl */ `
 #define samplesCount 5
 
-varying vec3 vPosition;
-varying vec3 vNormal;
-varying vec3 vTangent;
-varying vec3 vBitangent;
-varying vec2 vUv;
-varying float vThickness;
-varying vec3 vGlassColor;
-
-uniform sampler2D map;        // the scene rendered WITHOUT the feather
-uniform sampler2D envMap;     // equirect HDR
-uniform sampler2D colorsMap;  // row 0: dispersion spectrum, row 1: iridescence
-uniform sampler2D noiseMap;   // blue noise
-/* viewMatrix and cameraPosition are auto-declared by the material system's
-   fragment prefix; only projectionMatrix needs declaring here. */
-uniform mat4 projectionMatrix;
-uniform float seconds;
-
-uniform float iorStart;              // 1.214 captured
-uniform float iorDelta;              // 0.909 captured
-uniform float uvShiftFactor;         // 2.11
-uniform float useTransmittance;
-uniform float fringeMix;             // 0.86
-uniform float fringeCurve;           // 4.08
-uniform vec3 fringeColor;
-uniform float colorBoost;            // 2
-uniform float decayFactor;           // 20
-uniform float reflectionIridescence; // 0.28
-uniform float colorFactor;           // 2
-uniform float colorCurve;            // 1.34
-uniform float colorCurveR;
-uniform float colorCurveG;
-uniform float colorCurveB;
-uniform float envReflection;
-uniform float maxColorValue;         // 100 -> feeds the bloom
-
-float saturate1(float x) { return clamp(x, 0., 1.); }
-vec2 saturate2(vec2 x) { return clamp(x, 0., 1.); }
-
-float fresnelSchlick(vec3 rd, vec3 n) {
-  float cosTheta = saturate1(dot(-rd, n));
-  float f0 = 0.04;
-  return f0 + (1. - f0) * pow(1. - cosTheta, 5.);
-}
-
-vec3 getEnvColor(vec3 ray) {
-  vec2 uv = vec2(atan(ray.x, ray.z) * 0.5, asin(clamp(ray.y, -1., 1.)));
-  uv = uv * (1. / pi) + 0.5;
-  uv.x = fract(uv.x);
-  vec3 color = texture2D(envMap, uv).rgb;
-  // Rolloff tuned to this HDR: at -0.1 the studio map reflected near-black.
-  return 1. - exp(-0.9 * color);
-}
-
-vec3 getIridescence(vec3 rd, vec3 n) {
-  float thickness = 1. - abs(dot(n, rd));
-  return texture2D(colorsMap, vec2(thickness * 0.3 + 0.08, 0.75)).rgb;
-}
-
-vec3 mixToColor(float t) {
-  return texture2D(colorsMap, vec2(clamp(t, 0.02, 0.98), 0.25)).rgb;
-}
-
-vec3 getNormal() {
-  // Subtle procedural ridging in tangent space keeps the low-poly surface
-  // from reading as flat facets.
-  vec3 n = normalize(vNormal);
-  vec3 t = normalize(vTangent);
-  vec3 b = normalize(vBitangent);
-  // Enough to break up flat facets; at 0.04 this striped the blade white.
-  float ridge = sin(vUv.y * 90. + vUv.x * 14.) * 0.012;
-  return normalize(n + t * ridge);
-}
+uniform float uvShiftFactor;
+uniform float envRefraction;
+uniform float refractionIridescence;
 
 void main() {
-  vec3 normal = getNormal();
+  vec3 normal = normalize(vNormal);
   vec3 viewDirection = normalize(vPosition - cameraPosition);
-  if (dot(normal, viewDirection) > 0.) normal = -normal;
 
   vec3 refractionA = refract(viewDirection, normal, 1. / iorStart);
   vec3 refractionB = refract(viewDirection, normal, 1. / (iorStart + iorDelta));
@@ -157,33 +156,78 @@ void main() {
   clipA.xy /= 1.25;
   vec4 clipB = projectionMatrix * viewMatrix * vec4(vPosition + refractionB * vThickness, 1.0);
   clipB.xy /= 1.25;
-  vec2 uvA = saturate2(clipA.xy / clipA.w * 0.5 + 0.5);
-  vec2 uvB = saturate2(clipB.xy / clipB.w * 0.5 + 0.5);
+  vec2 uvA = clamp(clipA.xy / clipA.w * 0.5 + 0.5, 0., 1.);
+  vec2 uvB = clamp(clipB.xy / clipB.w * 0.5 + 0.5, 0., 1.);
+  vec2 dUv = (uvB - uvA) * uvShiftFactor;
 
   vec2 noiseUv = fract(uvA * 777. + seconds);
   float blue = texture2D(noiseMap, noiseUv).r;
+
+  float fringeness = fringeMix * pow(saturate1(1. - abs(dot(viewDirection, normal))), fringeCurve);
 
   vec3 color = vec3(0.);
   vec3 palAccum = vec3(0.);
   float dq = 1. / float(samplesCount);
   float mixFactor = blue * dq;
-  vec2 dUv = (uvB - uvA) * dq * uvShiftFactor;
-  vec2 uv = uvA + dUv * blue;
   for (int i = 0; i < samplesCount; i++) {
+    vec2 uv = uvA + dUv * mixFactor;
     vec3 texel = texture2D(map, uv).rgb;
+
+    /* THE MISSING WARMTH: the environment, seen through the glass along
+       this sample's own refracted ray. The wooden-studio HDR is orange -
+       this term is where the reference blade's peach interior comes from. */
+    vec3 ray = normalize(mix(refractionA, refractionB, mixFactor));
+    texel += getEnvColor(ray) * envRefraction;
+
     vec3 pal = mixToColor(mixFactor);
     palAccum += pal;
-    color += texel * pal;
-    uv += dUv;
+    texel = mix(texel, fringeColor, fringeness);
+    color += texel * pal * transmittance;
     mixFactor += dq;
   }
-  color *= transmittance / max(palAccum, vec3(1e-4));
+  color /= max(palAccum, vec3(1e-4));
+
+  vec3 iridescence = getIridescence(refractionA, normal) - 1.;
+  color *= refractionIridescence * iridescence + 1.;
+
+  gl_FragColor = vec4(color, 1.);
+}
+`;
+
+/* ── PASS 2: the front surface, refracting the back pass ──────────────── */
+
+export const GLASS_FRAGMENT = COMMON + /* glsl */ `
+uniform float colorBoost;
+uniform float decayFactor;
+uniform float reflectionIridescence;
+uniform float colorFactor;
+uniform float colorCurve;
+uniform float colorCurveR;
+uniform float colorCurveG;
+uniform float colorCurveB;
+uniform float envReflection;
+uniform float maxColorValue;
+
+void main() {
+  vec3 normal = normalize(vNormal);
+  vec3 viewDirection = normalize(vPosition - cameraPosition);
+  if (dot(normal, viewDirection) > 0.) normal = -normal;
+
+  /* One tap. The five-sample spectral loop belongs to the BACK pass; the
+     reference front surface just looks through at its result. */
+  vec3 refraction = refract(viewDirection, normal, 1. / iorStart);
+  vec4 clip = projectionMatrix * viewMatrix * vec4(vPosition + refraction * vThickness, 1.0);
+  clip.xy /= 1.25;
+  vec2 uv = clamp(clip.xy / clip.w * 0.5 + 0.5, 0., 1.);
+
+  float transmittance = 1. - useTransmittance * fresnelSchlick(refraction, normal);
+  vec3 color = texture2D(map, uv).rgb * transmittance;
 
   float fringeness = fringeMix * pow(saturate1(1. - abs(dot(viewDirection, normal))), fringeCurve);
   color = mix(color, fringeColor, fringeness);
 
   float luminance = dot(color, vec3(0.2126, 0.7152, 0.0722));
-  color = (color - luminance) * colorBoost + luminance;
+  color = max((color - luminance) * colorBoost + luminance, 0.);
 
   float decay = exp(-vThickness * decayFactor);
   color *= mix(vGlassColor, vec3(1.), decay);

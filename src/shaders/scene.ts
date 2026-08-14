@@ -26,11 +26,11 @@ void main() {
   vec2 c = vUv - vec2(0.5, 0.55);
   float r = length(c * vec2(1.6, 1.));
   // The reference frame is near-black away from the beam.
-  vec3 deep = vec3(0.0008, 0.0010, 0.0045);
-  vec3 pool = vec3(0.0020, 0.0045, 0.0180);
+  vec3 deep = vec3(0.0006, 0.0008, 0.0040);
+  vec3 pool = vec3(0.0015, 0.0030, 0.0160);
   vec3 col = mix(pool, deep, smoothstep(0.05, 0.85, r));
   float column = exp(-10. * abs(vUv.x - 0.5)) * smoothstep(0.0, 0.55, vUv.y);
-  col += vec3(0.014, 0.024, 0.078) * column;
+  col += vec3(0.006, 0.014, 0.070) * column;
   // A bright core directly behind the feather: this is what the glass
   // refracts and disperses. Without it the dispersion has nothing to bend.
   /* Tight and modest. sRGB output LIFTS the darks: a linear 0.2 displays
@@ -50,8 +50,17 @@ void main() {
      it was its RED: sRGB lifts the darks, so a wide lobe with r ~ g ~ b
      reads as a white ellipse. Keep the wide lobes strongly blue-dominant
      (r about 1/8 of b) and they read as blue haze at any amplitude. */
-  col += vec3(0.016, 0.048, 0.200) * exp(-5.0  * d2);   // outer blue disc
-  col += vec3(0.040, 0.100, 0.400) * exp(-17.0 * d2);   // inner blue bloom
+  /* SATURATION IS SET IN LINEAR, READ IN sRGB - and the gap between the
+     two is the whole "whitish center" bug. sRGB compresses ratios: a
+     linear g/b of 1/4 (what these lobes used to be) displays as g/b of
+     about 1/2 - the pale steel-blue wash. The reference's halo shows
+     g/b about 1/4 ON SCREEN, which back through the gamma curve means
+     green must sit near b/18 and red near b/25 IN THE SHADER. That is
+     what these amplitudes are. If it ever drifts pale again, the test
+     is one eyedropper away: sRGB green must stay near a QUARTER of
+     blue right next to the blade. */
+  col += vec3(0.010, 0.018, 0.230) * exp(-2.3  * d2);   // outer blue disc
+  col += vec3(0.022, 0.042, 0.460) * exp(-7.5  * d2);   // inner blue bloom
 
   /* The backlight the feather actually refracts, and the reason it was a
      flat blue crystal. The glass is a lens: whatever is behind it is what
@@ -75,8 +84,24 @@ void main() {
      amplitude. The glass no longer needs neutral light behind it: its
      sparkle comes from the fringe, the iridescence LUT and the env map. */
   float shaftFade = smoothstep(0.16, 0.40, vUv.y);
-  col += vec3(0.045, 0.105, 0.340) * exp(-dot(hv, hv)) * shaftFade;
-  col += vec3(0.030, 0.060, 0.180) * exp(-42.0 * d2);   // its soft spill
+  col += vec3(0.020, 0.045, 0.360) * exp(-dot(hv, hv)) * shaftFade;
+  col += vec3(0.014, 0.030, 0.240) * exp(-22.0 * d2);   // its soft spill
+
+  /* A HIDDEN near-neutral filament for the glass, not for the eye. The
+     feather is a lens: kill every neutral light behind it and its five
+     refraction taps can only return blue, so the blade flattens to indigo.
+     But paint that light visibly and the halo goes white again - the very
+     bug being fixed. The resolution is width: this band is narrower than
+     the blade itself (about 2/3 of its on-screen width), so the feather's
+     body OCCLUDES it completely; only the refraction taps, which sample
+     the scene where the ray EXITS the glass, ever read it. Same fade as
+     the shaft so nothing neutral survives below the blade's base. */
+  /* The near-neutral "hidden backlight" that used to sit here is DELETED.
+     It was premised on the blade occluding it; rendering with the feather
+     switched off proved otherwise - it was the whitish flame itself, and
+     the brightest thing in frame. Nothing near-neutral may live in the
+     background: the glass gets its colour from its own fringe, the
+     iridescence LUT and the env map instead. */
   gl_FragColor = vec4(col, 1.);
 }
 `;

@@ -25,6 +25,14 @@ import * as THREE from 'three';
  * indices below mean what they say.
  */
 
+// 20 box-averaged samples of the reference iridescence row, 0-255.
+const IRIDESCENCE: [number, number, number][] = [
+  [80, 90, 109], [187, 203, 226], [246, 206, 78], [227, 77, 15], [64, 46, 226],
+  [0, 207, 240], [153, 230, 9], [255, 67, 47], [187, 12, 254], [0, 180, 193],
+  [45, 237, 0], [253, 85, 100], [254, 0, 254], [45, 146, 162], [0, 223, 54],
+  [175, 157, 190], [255, 3, 181], [180, 105, 123], [0, 204, 179], [39, 202, 202],
+];
+
 // 20 box-averaged samples of the reference dispersion row, 0-255.
 const SPECTRUM: [number, number, number][] = [
   [7, 0, 26], [31, 0, 60], [38, 0, 87], [25, 6, 106], [2, 58, 118],
@@ -55,19 +63,23 @@ export function makeColorsLUT(): THREE.CanvasTexture {
       img.data[o + 3] = 255;
     }
 
-    // Row 1 -> v = 0.75: saturated per-texel confetti. Deterministic so the
-    // build is reproducible; statistically identical to the reference row.
-    let s = 0x9e3779b9;
-    const rng = (): number => {
-      s = (s * 1664525 + 1013904223) >>> 0;
-      return s / 4294967296;
-    };
+    // Row 1 -> v = 0.75: the iridescence row, resampled from the SAME
+    // 20 box-averaged blocks the reference's own 1024x2 LUT contains
+    // (read straight out of its inline base64 PNG). It is saturated
+    // colour BLOCKS - peach, gold, magenta, cyan, green - smoothly
+    // interpolated, NOT per-texel noise: at per-texel frequency the
+    // facets striped like a test card (tried it; instantly psychedelic).
     for (let x = 0; x < w; x++) {
-      const c = hslToRgb(rng(), 1.0, 0.15 + rng() * 0.65);
+      const f = (x / (w - 1)) * (IRIDESCENCE.length - 1);
+      const i0 = Math.floor(f);
+      const i1 = Math.min(IRIDESCENCE.length - 1, i0 + 1);
+      const t = f - i0;
       const o = (w + x) * 4;
-      img.data[o] = c[0];
-      img.data[o + 1] = c[1];
-      img.data[o + 2] = c[2];
+      for (let ch = 0; ch < 3; ch++) {
+        img.data[o + ch] = Math.round(
+          Math.min(255, IRIDESCENCE[i0][ch] * (1 - t) + IRIDESCENCE[i1][ch] * t),
+        );
+      }
       img.data[o + 3] = 255;
     }
     ctx.putImageData(img, 0, 0);
@@ -83,9 +95,3 @@ export function makeColorsLUT(): THREE.CanvasTexture {
   return tex;
 }
 
-function hslToRgb(h: number, s: number, l: number): [number, number, number] {
-  const k = (n: number) => (n + h * 12) % 12;
-  const a = s * Math.min(l, 1 - l);
-  const f = (n: number) => l - a * Math.max(-1, Math.min(k(n) - 3, Math.min(9 - k(n), 1)));
-  return [Math.round(f(0) * 255), Math.round(f(8) * 255), Math.round(f(4) * 255)];
-}
