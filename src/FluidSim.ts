@@ -26,11 +26,19 @@ import {
 
 const PRESSURE_ITERATIONS = 2;
 const VELOCITY_DISSIPATION = 0.99;
-const DENSITY_DISSIPATION = 0.955;
+/* 0.955 kept dye alive so long that the continuous ember stir built a
+   solid carpet edge to edge. The reference field is thin wires over black;
+   letting the dye die faster is what re-opens the dark gaps. */
+const DENSITY_DISSIPATION = 0.938;
 const PRESSURE_DECAY = 0.99;
 const CURL_STRENGTH = 10;
 const SPLAT_RADIUS = 0.0015;
-const NORMAL_EPSILON = 0.005;
+/* The reference stores this in its settings timeline as Fluid_epsSize.x
+   = 0.1 - twenty times larger. It is the amount of the dye gradient that
+   gets tilted into the pseudo-normal, so at 0.005 the normal was pinned to
+   (0,1,0), the delta map was near-black, and both the haze offset and the
+   filament emission had almost no signal to show. */
+const NORMAL_EPSILON = 0.1;
 const DS = 1 / 60;
 /* Caps the per-event pointer delta before the 1e4 amplification: batched
    pointer events or a frame hiccup must never inject velocity in the

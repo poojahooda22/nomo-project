@@ -26,11 +26,11 @@ void main() {
   vec2 c = vUv - vec2(0.5, 0.55);
   float r = length(c * vec2(1.6, 1.));
   // The reference frame is near-black away from the beam.
-  vec3 deep = vec3(0.001, 0.001, 0.007);
-  vec3 pool = vec3(0.003, 0.008, 0.035);
+  vec3 deep = vec3(0.0008, 0.0010, 0.0045);
+  vec3 pool = vec3(0.0020, 0.0045, 0.0180);
   vec3 col = mix(pool, deep, smoothstep(0.05, 0.85, r));
   float column = exp(-10. * abs(vUv.x - 0.5)) * smoothstep(0.0, 0.55, vUv.y);
-  col += vec3(0.025, 0.04, 0.125) * column;
+  col += vec3(0.014, 0.024, 0.078) * column;
   // A bright core directly behind the feather: this is what the glass
   // refracts and disperses. Without it the dispersion has nothing to bend.
   /* Tight and modest. sRGB output LIFTS the darks: a linear 0.2 displays
@@ -38,8 +38,45 @@ void main() {
      ellipse swallowing half the frame (it did). The glass only needs a
      hot SMALL core to disperse; the width comes from bloom, not from the
      background. */
-  vec2 cv = (vUv - vec2(0.5, 0.5)) * vec2(2.2, 1.1);
-  col += vec3(0.34, 0.42, 0.95) * exp(-60. * dot(cv, cv));
+  /* Aspect-corrected so the halo is a CIRCLE. The old (2.2, 1.1) scaling
+     stretched it into a lens twice as wide as tall, which is why widening
+     it flooded the top corners with navy instead of pooling around the
+     asset the way the reference does. */
+  vec2 cv = (vUv - vec2(0.5, 0.47)) * vec2(1.76, 1.1);
+  float d2 = dot(cv, cv);
+  /* THREE lobes, not one. The previous single tight gaussian is why the
+     reference's big soft blue disc around the asset was missing entirely.
+     The reason the old WIDE gaussian had to be deleted was not its width,
+     it was its RED: sRGB lifts the darks, so a wide lobe with r ~ g ~ b
+     reads as a white ellipse. Keep the wide lobes strongly blue-dominant
+     (r about 1/8 of b) and they read as blue haze at any amplitude. */
+  col += vec3(0.016, 0.048, 0.200) * exp(-5.0  * d2);   // outer blue disc
+  col += vec3(0.040, 0.100, 0.400) * exp(-17.0 * d2);   // inner blue bloom
+
+  /* The backlight the feather actually refracts, and the reason it was a
+     flat blue crystal. The glass is a lens: whatever is behind it is what
+     it shows, and colorBoost 1.55 then SATURATES that. With only a blue
+     halo behind it, a blue-dominant sample gets its red crushed toward
+     zero and the feather can be nothing but blue. The reference has a hot
+     near-white shaft standing behind the asset, so the taps come back
+     bright and near-neutral and the dispersion palette + glass tint are
+     free to colour them. Elongated on Y so it backs the whole blade, not
+     just its middle. */
+  vec2 hv = (vUv - vec2(0.5, 0.47)) * vec2(24.0, 2.5);
+  /* The shaft comes DOWN and dies at the blade's base - in the reference
+     nothing is lit below the asset. Without this cutoff it ran straight
+     off the bottom of the frame as a second beam.
+
+     SATURATED blue, never near-neutral. The tonemapper desaturates any
+     overbright pixel toward white and sRGB lifts the mids, so a neutral
+     shaft here reads as white fog poured over the blade - the reference
+     frame has no white anywhere except the beam's very core. Keep red
+     near an eighth of blue and the shaft stays a blue glow at any
+     amplitude. The glass no longer needs neutral light behind it: its
+     sparkle comes from the fringe, the iridescence LUT and the env map. */
+  float shaftFade = smoothstep(0.16, 0.40, vUv.y);
+  col += vec3(0.045, 0.105, 0.340) * exp(-dot(hv, hv)) * shaftFade;
+  col += vec3(0.030, 0.060, 0.180) * exp(-42.0 * d2);   // its soft spill
   gl_FragColor = vec4(col, 1.);
 }
 `;
@@ -78,6 +115,7 @@ uniform sampler2D map;
 uniform sampler2D simpleMap;
 uniform vec3 color;
 uniform float emissionFactor, emissionWhiteness, interpol, type, blueness, opacity;
+uniform vec3 rippleTint;
 
 float saturate1(float x) { return clamp(x, 0., 1.); }
 
@@ -115,24 +153,33 @@ void main() {
   if (type < 1.) {
     vec3 emi = texture2D(deltaMap, vUv).xyz;
     float luminance = dot(emi, vec3(0.2126, 0.7152, 0.0722));
-    /* The delta channels are |d normal.x|, |d normal.y|, |d normal.z| —
-       three DIFFERENT edge measurements that peak at slightly different
-       places along a filament. Giving each its own colour is what draws
-       the reference's chromatic fringing (magenta core, violet body, cyan
-       rim) instead of one flat tint. emissionWhiteness blends toward the
-       flat "color" tint for art-direction control. */
-    vec3 chroma = emi.r * vec3(1.0, 0.25, 0.85)
-                + emi.g * vec3(0.55, 0.35, 1.0)
-                + emi.b * vec3(0.3, 0.65, 1.0);
-    vec3 emiCol = mix(chroma, luminance * color, emissionWhiteness);
+    /* THIS is where the blue was coming from. The per-channel "chromatic
+       fringing" block that used to sit here mapped emi.b (the |d n.z| edge
+       measurement, which is just as strong as |d n.x|) onto CYAN, so every
+       filament came out magenta+cyan == pale blue.
+
+       The reference does no such thing. Its emission is one line:
+           emi = mix(emi, vec3(luminance), emissionWhiteness);
+           final += emi * emissionFactor * color;
+       and its color uniform is pure WHITE. The pink is not painted on - it is the
+       delta texture's own channel structure. The fluid normal is built
+       around vec3(0,1,0), so |d n.x| and |d n.z| carry all the signal while
+       |d n.y| stays near zero: R and B lit, G dark, i.e. magenta. Show the
+       channels honestly and the filaments are pink for free. */
+    vec3 emiCol = mix(emi, vec3(luminance), emissionWhiteness) * color;
     final += emiCol * emissionFactor * (1. - type);
   }
 
   if (type > 0.) {
-    /* Gated by real wave energy and left UNSATURATED, so a faint distant
-       ripple stays faint instead of being promoted to full blue. */
+    /* The reference adds this straight into .b, but only at blueness <= 0.1
+       (its GUI clamps the slider there). This build was running 0.28 into
+       .b AND a pure-blue trail overlay on top, which is the blue halo that
+       followed the cursor. It is a tint uniform now: feed it magenta and
+       the cursor wake belongs to the same palette as the filaments.
+       Still gated by real wave energy and left UNSATURATED, so a faint
+       distant ripple stays faint instead of being promoted to full tint. */
     float energy = min(length(slope) * 1.5, 1.);
-    final.b += energy * energy * blueness;
+    final += energy * energy * blueness * rippleTint;
   }
 
   vec2 vig = vUv * (1. - vUv) * 0.99 + 0.005;
@@ -223,6 +270,7 @@ precision highp float;
 varying vec2 vUv;
 uniform sampler2D trailMap, noisesMap;
 uniform float seconds;
+uniform vec3 trailColor;
 void main() {
   vec2 panningUV = -4. * vUv;  panningUV.y += seconds;
   vec4 noise = texture2D(noisesMap, panningUV);
@@ -234,7 +282,12 @@ void main() {
      tinting the raw channels can only ever produce yellow. The colour must
      be built from the height scalar. */
   float h = min(max(texture2D(trailMap, distortedUV).r, 0.), 2.);
-  gl_FragColor = vec4(vec3(0.1, 0.1, 1.) * h, clamp(h * 0.25, 0., 1.));
+  /* Was vec3(0.1, 0.1, 1.) - a pure blue smear painted over the finished
+     frame, drawn AFTER post so bloom never softened it. It was the single
+     most blue thing on screen whenever the pointer moved. Same magenta as
+     the filaments now, and dimmer, so it reads as the wake of the fluid
+     rather than a separate blue light source. */
+  gl_FragColor = vec4(trailColor * h, clamp(h * 0.18, 0., 1.));
 }
 `;
 

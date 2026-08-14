@@ -1,53 +1,85 @@
 import * as THREE from 'three';
 
 /**
- * The two-row colour LUT the glass samples: row 0 (v=0.25) is the
- * dispersion spectrum the five refraction taps are weighted by, row 1
- * (v=0.75) is the iridescence ramp indexed by facing angle.
+ * The colour LUT the glass samples. This is no longer a guess: it is a
+ * reconstruction of the 1024x2 LUT the reference ships as an inline
+ * base64 PNG, read straight out of its bundle.
  *
- * Generated rather than loaded: a known layout beats guessing at the
- * reference sprite's row order, and a transparent texel in a loaded PNG
- * silently zeroes the spectral weights (which reads as black speckles).
+ *   v = 0.25  ->  the DISPERSION spectrum used by mixToColor(). It is a
+ *                 spectral locus, not an HSL rainbow: it FADES TO BLACK at
+ *                 both ends (violet 7,0,26 -> red 11,3,0). Those dark ends
+ *                 are what stop the five refraction taps from painting a
+ *                 saturated red/violet rim on every silhouette edge.
+ *
+ *   v = 0.75  ->  the IRIDESCENCE ramp. In the reference this row is NOT a
+ *                 smooth gradient - it is high-frequency saturated confetti.
+ *                 Sampled at thickness*0.3+0.08, neighbouring facets land on
+ *                 wildly different hues, and THAT is the pink/teal/cream
+ *                 speckle over the reference feather. A smooth pastel ramp
+ *                 (what was here before) can only ever produce one flat tint.
+ *
+ * Row order matters and was previously inverted. THREE uploads textures with
+ * flipY = true by default, so canvas row 0 becomes v = 0.75 - the old file
+ * wrote the spectrum into row 0 and therefore fed the IRIDESCENCE row to the
+ * dispersion taps and vice versa. flipY is now explicitly false so the row
+ * indices below mean what they say.
  */
+
+// 20 box-averaged samples of the reference dispersion row, 0-255.
+const SPECTRUM: [number, number, number][] = [
+  [7, 0, 26], [31, 0, 60], [38, 0, 87], [25, 6, 106], [2, 58, 118],
+  [0, 113, 122], [0, 156, 118], [0, 188, 108], [18, 208, 89], [92, 218, 63],
+  [157, 216, 32], [204, 203, 37], [235, 180, 61], [250, 145, 65], [249, 99, 50],
+  [231, 48, 14], [197, 25, 0], [147, 29, 0], [81, 20, 0], [11, 3, 0],
+];
+
 export function makeColorsLUT(): THREE.CanvasTexture {
-  const w = 256;
+  const w = 1024;
   const canvas = document.createElement('canvas');
   canvas.width = w;
   canvas.height = 2;
   const ctx = canvas.getContext('2d');
   if (ctx) {
     const img = ctx.createImageData(w, 2);
+
+    // Row 0 -> v = 0.25: the dispersion spectrum, linearly resampled.
     for (let x = 0; x < w; x++) {
-      const t = x / (w - 1);
+      const f = (x / (w - 1)) * (SPECTRUM.length - 1);
+      const i0 = Math.floor(f);
+      const i1 = Math.min(SPECTRUM.length - 1, i0 + 1);
+      const t = f - i0;
+      const o = x * 4;
+      for (let ch = 0; ch < 3; ch++) {
+        img.data[o + ch] = Math.round(SPECTRUM[i0][ch] * (1 - t) + SPECTRUM[i1][ch] * t);
+      }
+      img.data[o + 3] = 255;
+    }
 
-      /* Row 0 — visible spectrum, violet at t=0 to red at t=1, as smooth
-         piecewise ramps over the classic hue order. */
-      const hue = (1 - t) * 270; // 270 violet -> 0 red
-      const c = hslToRgb(hue / 360, 1.0, 0.6);
-      img.data[x * 4] = c[0];
-      img.data[x * 4 + 1] = c[1];
-      img.data[x * 4 + 2] = c[2];
-      img.data[x * 4 + 3] = 255;
-
-      /* Row 1 — thin-film iridescence: phase-shifted sinusoids. Deeper
-         amplitude than a pastel so the facet colours actually read as
-         rainbow sparkle on the rotating glass, not a faint tint. */
-      const r = 0.62 + 0.38 * Math.sin(t * Math.PI * 4.0);
-      const g = 0.62 + 0.38 * Math.sin(t * Math.PI * 4.0 + 2.1);
-      const b = 0.62 + 0.38 * Math.sin(t * Math.PI * 4.0 + 4.2);
-      const i = (w + x) * 4;
-      img.data[i] = Math.round(r * 255);
-      img.data[i + 1] = Math.round(g * 255);
-      img.data[i + 2] = Math.round(b * 255);
-      img.data[i + 3] = 255;
+    // Row 1 -> v = 0.75: saturated per-texel confetti. Deterministic so the
+    // build is reproducible; statistically identical to the reference row.
+    let s = 0x9e3779b9;
+    const rng = (): number => {
+      s = (s * 1664525 + 1013904223) >>> 0;
+      return s / 4294967296;
+    };
+    for (let x = 0; x < w; x++) {
+      const c = hslToRgb(rng(), 1.0, 0.15 + rng() * 0.65);
+      const o = (w + x) * 4;
+      img.data[o] = c[0];
+      img.data[o + 1] = c[1];
+      img.data[o + 2] = c[2];
+      img.data[o + 3] = 255;
     }
     ctx.putImageData(img, 0, 0);
   }
   const tex = new THREE.CanvasTexture(canvas);
+  tex.flipY = false; // row 0 == v 0.25 == dispersion, row 1 == v 0.75 == iridescence
+  tex.colorSpace = THREE.SRGBColorSpace;
   tex.wrapS = THREE.ClampToEdgeWrapping;
   tex.wrapT = THREE.ClampToEdgeWrapping;
   tex.minFilter = THREE.LinearFilter;
   tex.magFilter = THREE.LinearFilter;
+  tex.generateMipmaps = false;
   return tex;
 }
 

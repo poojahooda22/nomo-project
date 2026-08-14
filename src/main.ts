@@ -136,11 +136,11 @@ const beamMat = new THREE.ShaderMaterial({
   vertexShader: BEAM_VERTEX,
   fragmentShader: BEAM_FRAGMENT,
   uniforms: {
-    color: { value: new THREE.Color(0.45, 0.55, 1.0) },
-    // Narrow and HOT: the reference beam is a thin bright shaft with a
-    // visible core, not a wide dim wash. Brightness comes from intensity
-    // on slim geometry; softness from the layered widths + bloom.
-    intensity: { value: 3.2 },
+    /* Deep saturated blue at moderate intensity. At 3.2 the layered
+       planes stacked past 1.0 where the tonemapper desaturates toward
+       white; the reference beam stays blue along its whole length. */
+    color: { value: new THREE.Color(0.3, 0.42, 1.0) },
+    intensity: { value: 2.4 },
     falloff: { value: 0.5 },
     opacity: { value: 0.05 },
   },
@@ -278,19 +278,25 @@ function makeCloud(type: number): THREE.ShaderMaterial {
       deltaMap: { value: null },
       map: { value: null },
       simpleMap: { value: null },
-      /* The delta texture's channels are normal-component differences,
-         not colours; shown raw they skew green-yellow. High whiteness
-         collapses them to luminance FIRST so the pink tint shows, and
-         factor 6 blooms without clipping to white. */
-      color: { value: new THREE.Color(1.0, 0.28, 0.75) },
-      emissionFactor: { value: 4.5 },
-      /* Lower whiteness now that the shader maps each delta channel to its
-         own colour (magenta/violet/cyan): the chromatic fringing IS the
-         reference look; whiteness only blends back toward the flat tint. */
-      emissionWhiteness: { value: 0.35 },
+      /* Reference values, read out of its own settings timeline
+         (timelines/dev.glb -> Water_emissionXWhitenessType = [5, 0, 0.01],
+         Water_color = [255,255,255]): emissionFactor 5, whiteness 0, and a
+         WHITE tint. The magenta is the delta texture's own R/B structure,
+         so the tint only has to avoid tinting it away. It is nudged a
+         little off white here - green pulled down, blue held under red -
+         because you asked for more pink and less blue, and that is exactly
+         the knob for it: at (1,1,1) the filaments sit at true magenta. */
+      color: { value: new THREE.Color(1.0, 0.42, 1.0) },
+      emissionFactor: { value: 3.4 },
+      /* 0.35 was pushing 35% of every filament toward grey. The reference
+         runs 0: full channel separation, which is what makes it read pink. */
+      emissionWhiteness: { value: 0.0 },
       interpol: { value: 0.5 },
-      type: { value: type },
-      blueness: { value: 0.28 },
+      /* The reference clamps this slider to 0.1 and this build was at 0.28,
+         straight into the blue channel. It is a tinted term now, so the
+         value is an intensity and the colour lives in rippleTint. */
+      blueness: { value: 0.5 },
+      rippleTint: { value: new THREE.Color(1.0, 0.18, 0.62) },
       /* The ripple quad REDRAWS the background over the disc: at 0.85 it
          was erasing 85% of the filaments under it. It only needs enough
          presence for the cursor shimmer. */
@@ -360,6 +366,7 @@ const trailMat = new THREE.ShaderMaterial({
     trailMap: { value: null },
     noisesMap: { value: null },
     seconds: { value: 0 },
+    trailColor: { value: new THREE.Color(1.0, 0.14, 0.55) },
   },
   transparent: true,
   depthWrite: false,
@@ -429,34 +436,54 @@ gltf.load('/models/feather.glb', (g) => {
       colorsMap: { value: colorsMap },
       noiseMap: { value: noiseMap },
       seconds: { value: 0 },
-      iorStart: { value: 1.214 },
-      iorDelta: { value: 0.909 },
-      uvShiftFactor: { value: 2.11 },
+      /* Everything below is lifted from the reference's own settings
+         timeline (timelines/dev.glb), where each uniform is stored as an
+         empty's xyz. No more guessing:
+           Glass_iorVDeltaXshift                  [1.3, 3, 1]
+           Glass_colorBoostFactorCurve            [1.55, 1, 0.95]
+           Glass_fringeCurveMix                   [4, 0.55, 0]
+           Glass_convexConcavePeaks               [0.5, 0.5, 3]
+           Glass_reflectionVIri                   [1, 0.2, 0]
+           Glass_colorMaxvalDecayUsetransmittance [50, 20, 1]
+           Glass_colorCurveRGB                    [1.15, 1.2, 1.1]
+           Glass_distResetX                       [0, 1, 0]
+           Glass_color      212,234,255   Glass_peaksColor 253,208,221
+           Glass_fringeColor 243,208,242
+         The big one is iorDelta 3.0 (this build had 0.909). That is what
+         spreads the five refraction taps far enough apart to actually
+         disperse - at 0.909 all five landed on nearly the same texel, so
+         the feather could only ever be the colour of whatever was behind
+         it, which is why it came out a single flat blue crystal. */
+      iorStart: { value: 1.3 },
+      iorDelta: { value: 3.0 },
+      uvShiftFactor: { value: 1.0 },
       useTransmittance: { value: 1 },
-      /* 0.86 white rim swallowed the whole silhouette — the washed-out
-         white feather. The rim should be an accent over the glass, not
-         the glass. */
-      fringeMix: { value: 0.42 },
-      fringeCurve: { value: 4.08 },
-      fringeColor: { value: new THREE.Color(0.95, 0.97, 1.0) },
-      colorBoost: { value: 2 },
-      // 20 killed the interior tint entirely (exp(-20t) ~ 0 everywhere).
-      decayFactor: { value: 9 },
-      // The rainbow facet sparkle lives here: it scales the iridescence
-      // LUT on the env reflection. 0.28 was barely visible.
-      reflectionIridescence: { value: 0.85 },
-      colorFactor: { value: 1.45 },
-      colorCurve: { value: 1.1 },
-      colorCurveR: { value: 1 },
-      colorCurveG: { value: 1 },
-      colorCurveB: { value: 1 },
-      envReflection: { value: 1.6 },
-      maxColorValue: { value: 5 },  // 100 nukes the bloom chain into one white blob
+      fringeMix: { value: 0.55 },
+      fringeCurve: { value: 4.0 },
+      fringeColor: { value: new THREE.Color(243 / 255, 208 / 255, 242 / 255) },
+      colorBoost: { value: 1.55 },
+      decayFactor: { value: 20 },
+      /* Reference value is 0.2. Pushed up because this build has no second
+         refraction-iridescence term (Glass_refractionVIri = [0.6, 0.15])
+         to carry facet colour, so all of it has to ride on the reflection. */
+      reflectionIridescence: { value: 0.55 },
+      colorFactor: { value: 1.25 },
+      colorCurve: { value: 0.95 },
+      colorCurveR: { value: 1.15 },
+      colorCurveG: { value: 1.2 },
+      colorCurveB: { value: 1.1 },
+      envReflection: { value: 1.5 },
+      maxColorValue: { value: 50 },
+      /* Glass_distResetX = [0, 1, 0]: the reference runs resetDistances 1,
+         i.e. a CONSTANT thickness of 0.1 world units rather than the baked
+         per-vertex attribute. decayFactor 20 is calibrated against that
+         0.1 - exp(-0.1*20) = 0.135, so the glass tint survives instead of
+         being annihilated the way it was with a 0.3-scaled thickness. */
       distancesFactor: { value: thicknessScale },
-      resetDistances: { value: 0 },
-      peaksFactor: { value: 2.45 },
-      baseColor: { value: new THREE.Color(0.72, 0.58, 1.0) },
-      peaksColor: { value: new THREE.Color(1.0, 0.75, 1.0) },
+      resetDistances: { value: 1 },
+      peaksFactor: { value: 3.0 },
+      baseColor: { value: new THREE.Color(212 / 255, 234 / 255, 255 / 255) },
+      peaksColor: { value: new THREE.Color(253 / 255, 208 / 255, 221 / 255) },
     },
   });
   featherMesh = new THREE.Mesh(geo, glassMat);
@@ -513,10 +540,18 @@ let nextSplat = 0;
    stir that keeps the whole disc etched. (In disc-UV space; impulses run
    through the same MAX_IMPULSE cap as the mouse.) */
 const EMBERS = [
-  { r: 0.13, rv: 0.6, w: 0.5, p: 0.0 },
+  /* Two INNER embers orbit tight and fast around the disc centre, so the
+     region under the feather churns as strongly at idle as the outer
+     field does - previously nothing stirred inside r 0.13 and the centre
+     only lit up when the mouse crossed it. Higher angular speed keeps
+     their linear speed (and so their splat strength) comparable to the
+     wide slow orbits. */
+  { r: 0.05, rv: 0.8, w: 0.9, p: 3.3 },
+  { r: 0.09, rv: 0.7, w: -0.7, p: 5.0 },
+  { r: 0.16, rv: 0.6, w: 0.5, p: 0.0 },
   { r: 0.24, rv: 0.55, w: -0.37, p: 2.1 },
-  { r: 0.36, rv: 0.5, w: 0.26, p: 4.4 },
-  { r: 0.44, rv: 0.45, w: -0.19, p: 1.2 },
+  { r: 0.33, rv: 0.5, w: 0.26, p: 4.4 },
+  { r: 0.42, rv: 0.45, w: -0.19, p: 1.2 },
 ];
 const emberPrev = EMBERS.map(() => new THREE.Vector2(-1, -1));
 function stirEmbers(seconds: number): void {

@@ -120,7 +120,7 @@ vec3 getEnvColor(vec3 ray) {
   uv.x = fract(uv.x);
   vec3 color = texture2D(envMap, uv).rgb;
   // Rolloff tuned to this HDR: at -0.1 the studio map reflected near-black.
-  return 1. - exp(-0.45 * color);
+  return 1. - exp(-0.9 * color);
 }
 
 vec3 getIridescence(vec3 rd, vec3 n) {
