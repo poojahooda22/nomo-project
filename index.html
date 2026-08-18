@@ -5,30 +5,58 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta
       name="description"
-      content="Ashling. A storytelling studio. It is where sparks become wildfire."
+      content="Ashling. Real-time treasury infrastructure. One API for balances, payments and reconciliation across 40 currencies."
     />
-    <title>Ashling Storytelling</title>
+    <title>Ashling — Real-time treasury infrastructure</title>
   </head>
   <body>
+    <!-- The cursor fluid. Fixed above the layout at z-index 15 and composited
+         with screen blending, so the dark ground between its filaments drops
+         away and only the light survives over the page. Untouched by the
+         layout change: nothing below it is a dependency of the simulation. -->
     <div id="gl" aria-hidden="true"></div>
 
-    <main class="hero">
-      <header class="hero__bar">
-        <a class="hero__brand" href="#top">ashling<span class="hero__brand-script">Storytelling</span></a>
-        <nav class="hero__nav" aria-label="Primary">
-          <a href="#agency">Agency</a>
-          <a href="#labs">Labs</a>
-          <a href="#contact">Contact</a>
+    <main class="page">
+      <header class="topbar">
+        <a class="mark" href="#top" aria-label="Home">/</a>
+
+        <!-- Centred against the VIEWPORT, not against the space left over by
+             its neighbours. The grid's two side tracks are both 1fr, which is
+             what keeps this on the true centre line even though the mark is
+             28px and the actions are ten times that. -->
+        <p class="awards">
+          1X WEBBY AWARD <span class="awards__sep">&bull;</span> 5X FWA
+          <span class="awards__sep">&bull;</span> 18X AWWWARDS
+          <span class="awards__sep">&bull;</span> 21X CSSDA
+        </p>
+
+        <nav class="actions" aria-label="Primary">
+          <a class="btn btn--ghost" href="#pricing">PRICING</a>
+          <a class="btn btn--solid" href="#contact">START A CONVERSATION</a>
+          <div class="lang" role="group" aria-label="Language">
+            <button class="lang__opt" type="button">FR</button>
+            <button class="lang__opt is-active" type="button" aria-current="true">EN</button>
+          </div>
         </nav>
       </header>
 
-      <p class="hero__lede">Storytelling is much<br />more than words.</p>
-
-      <h1 class="hero__line">
-        It is where sparks<br />become <em>wildfire.</em>
-      </h1>
-
-      <button class="hero__dots" type="button" aria-label="Menu">&hellip;</button>
+      <!-- Written to a shape as well as to a meaning. The six-line ragged
+           block landing on one short word is a function of word lengths
+           against the em-locked column in the stylesheet, not of character
+           count alone: a 62-character line reading "Real-time treasury for
+           finance teams..." wraps to five and ends on a full line, because
+           nothing in it is long enough to claim a line of its own.
+           "infrastructure" measures 727px against the 800px column, so it
+           takes one, and the tail falls to a single word. -->
+      <div class="hero">
+        <h1 class="hero__title">
+          Treasury infrastructure for finance teams that can&rsquo;t afford to wait
+        </h1>
+        <p class="hero__sub">
+          One API for balances, payments and reconciliation,<br />
+          live across 40 currencies and settling in seconds.
+        </p>
+      </div>
     </main>
 
     <div class="cursor-ring" aria-hidden="true"></div>

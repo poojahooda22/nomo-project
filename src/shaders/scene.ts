@@ -7,7 +7,7 @@
 
 export const OVERSCAN = 1.25;
 
-/* ── Background: deep blue radial pool around the beam ─────────────────── */
+/* ── Background: the black ground the fluid is drawn on ────────────────── */
 
 export const BG_VERTEX = /* glsl */ `
 varying vec2 vUv;
@@ -18,68 +18,26 @@ void main() {
 }
 `;
 
+/*
+  Flat black, and it still has to be a real pass rather than a clear colour.
+
+  The fluid consumer does not draw ONTO the frame - it SAMPLES this target as
+  its base (`final = texture2D(map, uv)`) and adds its emission on top, with
+  the sample point displaced by the haze. Skip the pass and it reads an empty
+  target through that displacement, so the filaments lose the ground they sit
+  on at exactly the moment the cursor disturbs it.
+
+  Not pure zero: a hair of blue in the floor keeps the dark gaps between
+  filaments reading as night rather than as a hole punched in the page, and
+  it is far below the threshold where the bloom can find it.
+*/
 export const BG_FRAGMENT = /* glsl */ `
 precision highp float;
 varying vec2 vUv;
 uniform float seconds;
 
-/* THE BLUE CIRCLE, as one legible radial profile.
- *
- * Geometry: everything is a function of ONE distance d from the glow
- * centre (0.5, 0.47) in aspect-corrected UV, so the glow is a true circle
- * that cannot smear into an ellipse or a shaft. There are no elongated
- * lobes, no vertical bands, and nothing near-neutral anywhere in this
- * shader - the beam is separate slim geometry in the scene.
- *
- * Radial budget (fractions are of the glow radius R = 0.62 UV, which the
- * composite's 1.25 un-zoom shows as about 55-60 percent of frame height -
- * measure the reference and that is the figure you get):
- *   d = 0.00        bright royal core behind the blade
- *   d = 0.35 R      half the core brightness
- *   d = 1.00 R      under a tenth - the visible edge of the circle
- *   beyond          the deep floor, then black corners
- *
- * Colour: the ratios are set for what they DISPLAY as, not what they read
- * as. sRGB compresses ratios, so to SHOW green at a quarter of blue (the
- * reference's halo, one eyedropper away) the shader must FEED green near
- * blue/18 and red near blue/25. Every term below obeys r <= b/14,
- * g <= b/9. If any future edit adds a glow with more red or green than
- * that, it will read whitish - that exact mistake has been made and
- * reverted three times in this file's history. */
 void main() {
-  /* Aspect-corrected offset from the glow centre. 1.6 is the design
-     aspect; at other window shapes the circle stays a circle because both
-     axes use the same UV frame the composite un-zooms. */
-  vec2 cv = (vUv - vec2(0.5, 0.47)) * vec2(1.6, 1.0);
-  float d2 = dot(cv, cv);
-
-  /* The floor: corners are BLACK. Not navy - black with the faintest blue
-     cast so the fluid's dark gaps still read as night rather than void. */
-  vec3 col = vec3(0.00006, 0.00008, 0.00080);
-
-  /* The circle. Three concentric gaussians of one hue family, exponents
-     chosen so the glow has ENDED by half a frame from centre:
-       exp(-24 d2): the core right behind the blade (its backlight)
-       exp(-10 d2): the body of the circle
-       exp(- 8.0 d2): the last soft skirt. NOTE the overscan: the
-                      composite un-zoom means a screen corner sits at only
-                      d2 of about 0.5 in this shader's UV, not 1.0 - so
-                      the skirt must already be dead at d2 = 0.5
-                      (exp(-4) = 0.018 of a small amplitude). The old
-                      outer lobe used exp(-2.3 d2) at 6x this amplitude,
-                      still 40 percent alive at the corners - that single
-                      number was the blue-flooded canvas. */
-  col += vec3(0.0016, 0.0034, 0.042) * exp(-9.5 * d2);
-  col += vec3(0.0090, 0.0180, 0.230) * exp(-10.0 * d2);
-  col += vec3(0.0220, 0.0420, 0.520) * exp(-24.0 * d2);
-
-  /* The beam's landing glow: a SMALL brightening where the beam meets the
-     blade tip, so the slim beam geometry does not look pasted on. Tight
-     (exp(-90)) and the same hue family - this is NOT a shaft. */
-  vec2 tv = (vUv - vec2(0.5, 0.60)) * vec2(1.6, 1.0);
-  col += vec3(0.0140, 0.0300, 0.340) * exp(-90.0 * dot(tv, tv));
-
-  gl_FragColor = vec4(col, 1.);
+  gl_FragColor = vec4(vec3(0.0006, 0.0006, 0.0011), 1.);
 }
 `;
 
@@ -190,87 +148,6 @@ void main() {
 }
 `;
 
-/* ── The light beam: layered additive planes, exponential height fade ─── */
-
-export const BEAM_VERTEX = /* glsl */ `
-varying vec3 vPosition;
-varying vec2 vUv;
-void main() {
-  vPosition = position;
-  vUv = uv;
-  gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.);
-  gl_Position.xy /= ${OVERSCAN};
-}
-`;
-
-/* Adaptation over the captured shader: a soft horizontal profile so the
-   plane's rectangular border never shows. The captured version had only
-   the vertical falloff; its horizontal softness must have lived in
-   geometry or a texture that was not recoverable. */
-export const BEAM_FRAGMENT = /* glsl */ `
-precision highp float;
-varying vec3 vPosition;
-varying vec2 vUv;
-uniform vec3 color;
-uniform float intensity, falloff, opacity;
-void main() {
-  vec3 res = color * intensity;
-  float y = vPosition.y;
-  res *= exp(-falloff * abs(y)) * step(0., y);
-  float edge = 1. - abs(vUv.x - 0.5) * 2.;
-  res *= edge * edge * (3. - 2. * edge);
-  gl_FragColor = vec4(res, opacity);
-}
-`;
-
-/* ── Dust: one gl_Points cloud, fountain-recycled in the vertex shader ── */
-
-export const DUST_VERTEX = /* glsl */ `
-attribute float aBirthTime, aSize, aRandomOpacity, aRandomSpeed;
-attribute vec2 aDrift;
-uniform float seconds, lifeTime, speed, baseSize;
-uniform float wanderAmp, wanderFreq;
-varying float vOpacity;
-void main() {
-  float localTime = mod(seconds + aBirthTime, lifeTime);
-  float progress = localTime / lifeTime;
-  vec3 pos = position;
-  pos.y  += progress * speed * aRandomSpeed;
-  pos.xz += aDrift * progress;
-
-  /* Serpentine wander. aDrift alone is a LINEAR offset, so a mote can only
-     ever travel in a straight line from where it spawned - which is why the
-     rising sparks read as ruled pencil strokes. Two out-of-phase sines on x
-     and z bend that line into a climbing zigzag. The rate is scaled per
-     particle (aRandomOpacity is already a stable 0.4-1.0 per-mote random)
-     so they never oscillate in lockstep, and the amplitude grows with
-     progress so each spark leaves its source cleanly and widens as it
-     rises. wanderAmp is 0 for the ambient dust, which is unchanged. */
-  float ph = aBirthTime * 9.7;
-  float rate = wanderFreq * (0.7 + aRandomOpacity * 0.6);
-  float sway = wanderAmp * progress;
-  pos.x += sin(progress * rate + ph) * sway;
-  pos.z += cos(progress * rate * 0.8 + ph * 1.6) * sway * 0.7;
-  vOpacity = smoothstep(0., 0.1, progress) * (1. - smoothstep(0.8, 1., progress));
-  vOpacity *= aRandomOpacity;
-  vec4 mvPosition = modelViewMatrix * vec4(pos, 1.);
-  gl_PointSize = (baseSize + aSize) * (150. / -mvPosition.z);
-  gl_Position = projectionMatrix * mvPosition;
-  gl_Position.xy /= ${OVERSCAN};
-}
-`;
-
-export const DUST_FRAGMENT = /* glsl */ `
-precision highp float;
-varying float vOpacity;
-uniform vec3 color;
-void main() {
-  float d = length(gl_PointCoord - 0.5) * 2.;
-  float a = smoothstep(1., 0.2, d) * vOpacity;
-  gl_FragColor = vec4(color, a);
-}
-`;
-
 /* ── Cursor trail overlay: noise-wobbled blue readout of the ripple sim.
    Drawn AFTER the composite, so no overscan here. ─────────────────────── */
 
@@ -305,20 +182,5 @@ void main() {
      the filaments now, and dimmer, so it reads as the wake of the fluid
      rather than a separate blue light source. */
   gl_FragColor = vec4(trailColor * h, clamp(h * 0.18, 0., 1.));
-}
-`;
-
-/* ── Spawner override: flat white silhouette for the fluid injector ───── */
-
-export const SPAWNER_VERTEX = /* glsl */ `
-void main() {
-  gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.);
-}
-`;
-
-export const SPAWNER_FRAGMENT = /* glsl */ `
-precision highp float;
-void main() {
-  gl_FragColor = vec4(1.);
 }
 `;

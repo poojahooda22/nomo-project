@@ -1,40 +1,32 @@
 import './styles.css';
 import * as THREE from 'three';
-import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
-import { DRACOLoader } from 'three/examples/jsm/loaders/DRACOLoader.js';
-import { RGBELoader } from 'three/examples/jsm/loaders/RGBELoader.js';
 import { FluidSim } from './FluidSim';
 import { RippleSim, RIPPLE_SIM_SIZE } from './RippleSim';
 import { PostChain } from './PostChain';
-import { makeColorsLUT } from './lut';
-import { GLASS_BACK_FRAGMENT, GLASS_BACK_VERTEX, GLASS_FRAGMENT, GLASS_VERTEX } from './shaders/glass';
+import { PageTexture } from './PageTexture';
 import {
-  BEAM_FRAGMENT,
-  BEAM_VERTEX,
   BG_FRAGMENT,
   BG_VERTEX,
   CLOUD_FRAGMENT,
   CLOUD_VERTEX,
-  DUST_FRAGMENT,
-  DUST_VERTEX,
-  SPAWNER_FRAGMENT,
-  SPAWNER_VERTEX,
   TRAIL_FRAGMENT,
   TRAIL_VERTEX,
 } from './shaders/scene';
 
 /**
- * Frame graph, in the captured order:
- *   1. both simulations step (fluid exhales from the feather's silhouette,
- *      ripple hugs the cursor)
- *   2. background layer -> rtA
- *   3. rtA + cloud planes (haze + pink filaments + blue shimmer) -> rtBG
- *   4. rtBG + the glass feather (which refracts rtBG) -> rtFinal
- *   5. post: threshold -> 5-mip bloom -> composite (un-overscan, halo,
- *      PBR Neutral, dither) -> screen
- *   6. cursor trail overlay, straight to screen
+ * Frame graph, in order:
+ *   1. both simulations step (fluid and ripple, driven only by the cursor)
+ *   2. background -> rtA
+ *   3. rtA + the two cloud planes (haze + filaments + cursor shimmer) -> rtBG
+ *   4. post: threshold -> 5-mip bloom -> composite (un-overscan, halo,
+ *      tonemap, dither) -> screen
+ *   5. cursor trail overlay, straight to screen
  *
- * Everything before step 5 renders with 25% overscan.
+ * Everything before step 4 renders 25% larger than the frame so the haze and
+ * the halo can sample past the visible edge without finding a black border;
+ * the composite un-zooms. That un-zoom lives in PostChain, which is why the
+ * post step is not optional scenery - bypass it and the whole frame is
+ * cropped 25% in.
  */
 
 const params = new URLSearchParams(location.search);
@@ -42,24 +34,21 @@ const LITE = params.has('lite');
 const qdpr = Number(params.get('qdpr'));
 const DPR = Number.isFinite(qdpr) && qdpr > 0 ? qdpr : LITE ? 0.75 : Math.min(window.devicePixelRatio || 1, 2);
 const FLUID_PIXELS = LITE ? 2 ** 16 : 2 ** 18;
-/* Injected EVERY frame against dissipation 0.99: steady state is
-   injection / 0.01, so 1.6 here meant a plume velocity near 160, a
-   permanently over-driven convection cell. These keep the idle plume
-   alive but breathing. */
-/* Near-silent. The reference's idle hero is CLEAN - a blue gradient, the
-   feather, nothing else - so the exhale is kept just strong enough that the
-   beam column stays faintly alive, far below filament-forming strength.
-   Every visible filament should be one the cursor drew. */
-const SPAWN_VELOCITY = 0.022;
-const SPAWN_DENSITY = 0.006;
 
-// Layer isolation switches: how the artifacts above were pinned down.
+// Layer isolation switches: how the artifacts in this scene were pinned down.
 const SHOW = {
   fluidCloud: !params.has('nofluidcloud'),
   rippleCloud: !params.has('noripplecloud'),
-  feather: !params.has('nofeather'),
   post: !params.has('nopost'),
   trail: !params.has('notrail'),
+  /* The idle drift that keeps the fluid moving with no cursor on it.
+     Switchable so the untouched-page behaviour can still be observed. */
+  ambient: !params.has('noambient'),
+  /* Draws the rasterised page straight to the frame instead of the scene, so
+     the raster can be compared against the DOM that produced it. Off by
+     default: the DOM is still the visible path and nothing about the
+     composite has changed yet. */
+  pageTexture: params.has('pagetex'),
 };
 
 declare global {
@@ -112,13 +101,6 @@ function makeSceneTarget(): THREE.WebGLRenderTarget {
 }
 let rtA = makeSceneTarget();
 let rtBG = makeSceneTarget();
-let rtBack = makeSceneTarget(); // scene + the feather's BACK-face glass pass
-let rtFinal = makeSceneTarget();
-const spawnerRT = new THREE.WebGLRenderTarget(256, 144, {
-  minFilter: THREE.LinearFilter,
-  magFilter: THREE.LinearFilter,
-  depthBuffer: false,
-});
 
 const post = new PostChain(renderer);
 post.resize(Math.round(window.innerWidth * DPR), Math.round(window.innerHeight * DPR));
@@ -135,154 +117,6 @@ const bgMat = new THREE.ShaderMaterial({
 });
 bgScene.add(new THREE.Mesh(new THREE.PlaneGeometry(2, 2), bgMat));
 
-// The beam: two crossed planes, rotated so the bright core sits at the top
-// of frame and the exponential falloff runs DOWN toward the feather.
-const beamMat = new THREE.ShaderMaterial({
-  vertexShader: BEAM_VERTEX,
-  fragmentShader: BEAM_FRAGMENT,
-  uniforms: {
-    /* Slim, saturated, and DYING before the blade. In the reference the
-       beam is a thin bright line from the top of frame that fades out just
-       above the feather tip; nothing white ever lies over the blade. Keep
-       green under a quarter of blue (sRGB doubles the displayed ratio) and
-       let falloff 0.85 extinguish the column before it reaches the glass. */
-    color: { value: new THREE.Color(0.10, 0.20, 1.0) },
-    intensity: { value: 2.0 },
-    falloff: { value: 0.85 },
-    opacity: { value: 0.05 },
-  },
-  transparent: true,
-  blending: THREE.AdditiveBlending,
-  depthWrite: false,
-  side: THREE.DoubleSide,
-});
-const beamGroup = new THREE.Group();
-const BEAM_WIDTHS = [0.55, 0.32, 0.14];
-for (let i = 0; i < BEAM_WIDTHS.length; i++) {
-  const plane = new THREE.Mesh(new THREE.PlaneGeometry(BEAM_WIDTHS[i], 9), beamMat);
-  plane.rotation.y = (i * Math.PI) / 3;
-  plane.rotation.z = Math.PI; // local +y points down: bright top, fade down
-  plane.position.set(0, 3.6, -0.3);
-  beamGroup.add(plane);
-}
-bgScene.add(beamGroup);
-
-// Dust: a single fountain-recycled point cloud, all motion in the vertex shader.
-const DUST_COUNT = 320;
-const dustGeo = new THREE.BufferGeometry();
-{
-  const pos = new Float32Array(DUST_COUNT * 3);
-  const birth = new Float32Array(DUST_COUNT);
-  const size = new Float32Array(DUST_COUNT);
-  const opac = new Float32Array(DUST_COUNT);
-  const speed = new Float32Array(DUST_COUNT);
-  const drift = new Float32Array(DUST_COUNT * 2);
-  let s = 9241;
-  const rng = () => {
-    s = (s * 1664525 + 1013904223) >>> 0;
-    return s / 4294967296;
-  };
-  for (let i = 0; i < DUST_COUNT; i++) {
-    pos[i * 3] = (rng() * 2 - 1) * 3.4;
-    pos[i * 3 + 1] = -1.6 + rng() * 3.4;
-    pos[i * 3 + 2] = -1.2 + rng() * 2.0;
-    birth[i] = rng() * 2.5;
-    size[i] = rng() * 0.05;
-    opac[i] = 0.25 + rng() * 0.75;
-    speed[i] = 0.4 + rng() * 1.2;
-    drift[i * 2] = (rng() - 0.5) * 0.3;
-    drift[i * 2 + 1] = (rng() - 0.5) * 0.3;
-  }
-  dustGeo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
-  dustGeo.setAttribute('aBirthTime', new THREE.BufferAttribute(birth, 1));
-  dustGeo.setAttribute('aSize', new THREE.BufferAttribute(size, 1));
-  dustGeo.setAttribute('aRandomOpacity', new THREE.BufferAttribute(opac, 1));
-  dustGeo.setAttribute('aRandomSpeed', new THREE.BufferAttribute(speed, 1));
-  dustGeo.setAttribute('aDrift', new THREE.BufferAttribute(drift, 2));
-}
-const dustMat = new THREE.ShaderMaterial({
-  vertexShader: DUST_VERTEX,
-  fragmentShader: DUST_FRAGMENT,
-  uniforms: {
-    seconds: { value: 0 },
-    lifeTime: { value: 2.5 },
-    speed: { value: 0.5 },
-    baseSize: { value: 0.04 },
-    // Ambient dust keeps its straight linear drift, unchanged.
-    wanderAmp: { value: 0.0 },
-    wanderFreq: { value: 0.0 },
-    color: { value: new THREE.Color(0.65, 0.75, 1.0) },
-  },
-  transparent: true,
-  blending: THREE.AdditiveBlending,
-  depthWrite: false,
-});
-const dust = new THREE.Points(dustGeo, dustMat);
-dust.frustumCulled = false;
-bgScene.add(dust);
-
-/* Spark stream: a second, tighter particle system that rises INSIDE the
-   beam column — one coherent upward current of bright motes, distinct
-   from the ambient drifting dust ("particles moving in one flame"). */
-const SPARK_COUNT = 110;
-const sparkGeo = new THREE.BufferGeometry();
-{
-  const pos = new Float32Array(SPARK_COUNT * 3);
-  const birth = new Float32Array(SPARK_COUNT);
-  const size = new Float32Array(SPARK_COUNT);
-  const opac = new Float32Array(SPARK_COUNT);
-  const speed = new Float32Array(SPARK_COUNT);
-  const drift = new Float32Array(SPARK_COUNT * 2);
-  let s = 5077;
-  const rng = () => {
-    s = (s * 1664525 + 1013904223) >>> 0;
-    return s / 4294967296;
-  };
-  for (let i = 0; i < SPARK_COUNT; i++) {
-    const r = Math.sqrt(rng()) * 0.16;      // column radius
-    const a = rng() * Math.PI * 2;
-    pos[i * 3] = Math.cos(a) * r;
-    pos[i * 3 + 1] = -0.6 + rng() * 0.8;    // spawn low, around the feather base
-    pos[i * 3 + 2] = -0.3 + Math.sin(a) * r;
-    birth[i] = rng() * 2.2;
-    size[i] = rng() * 0.05;
-    opac[i] = 0.4 + rng() * 0.6;
-    speed[i] = 0.8 + rng() * 0.7;           // brisk, all upward: one current
-    drift[i * 2] = (rng() - 0.5) * 0.08;    // barely any sideways wander
-    drift[i * 2 + 1] = (rng() - 0.5) * 0.08;
-  }
-  sparkGeo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
-  sparkGeo.setAttribute('aBirthTime', new THREE.BufferAttribute(birth, 1));
-  sparkGeo.setAttribute('aSize', new THREE.BufferAttribute(size, 1));
-  sparkGeo.setAttribute('aRandomOpacity', new THREE.BufferAttribute(opac, 1));
-  sparkGeo.setAttribute('aRandomSpeed', new THREE.BufferAttribute(speed, 1));
-  sparkGeo.setAttribute('aDrift', new THREE.BufferAttribute(drift, 2));
-}
-const sparkMat = new THREE.ShaderMaterial({
-  vertexShader: DUST_VERTEX,
-  fragmentShader: DUST_FRAGMENT,
-  uniforms: {
-    seconds: { value: 0 },
-    lifeTime: { value: 2.2 },
-    speed: { value: 1.6 },
-    baseSize: { value: 0.05 },
-    /* The zigzag: roughly two and a half lateral swings over a mote's
-       2.2s life, wide enough to read as a wandering path rather than a
-       ruled line, tight enough to stay inside the beam column. */
-    wanderAmp: { value: 0.16 },
-    wanderFreq: { value: 15.0 },
-    /* Sub-HDR: at 1.12 the spark motes crossed the bloom threshold and
-       smeared a white plume up the beam column, over the blade. */
-    color: { value: new THREE.Color(0.30, 0.42, 0.95) },
-  },
-  transparent: true,
-  blending: THREE.AdditiveBlending,
-  depthWrite: false,
-});
-const sparks = new THREE.Points(sparkGeo, sparkMat);
-sparks.frustumCulled = false;
-bgScene.add(sparks);
-
 /* ── Cloud planes: the two sim consumers ───────────────────────────────── */
 
 const cloudScene = new THREE.Scene();
@@ -295,28 +129,26 @@ function makeCloud(type: number): THREE.ShaderMaterial {
       deltaMap: { value: null },
       map: { value: null },
       simpleMap: { value: null },
-      /* Reference values, read out of its own settings timeline
-         (timelines/dev.glb -> Water_emissionXWhitenessType = [5, 0, 0.01],
-         Water_color = [255,255,255]): emissionFactor 5, whiteness 0, and a
-         WHITE tint. The magenta is the delta texture's own R/B structure,
-         so the tint only has to avoid tinting it away. It is nudged a
-         little off white here - green pulled down, blue held under red -
-         because you asked for more pink and less blue, and that is exactly
-         the knob for it: at (1,1,1) the filaments sit at true magenta. */
+      /* The pink is NOT painted on. The fluid normal is built around
+         vec3(0,1,0), so the x and z components of its change carry all the
+         signal while y stays near zero: R and B lit, G dark, which is
+         magenta. This tint only has to avoid tinting that away - at pure
+         white the filaments sit at true magenta, and green pulled down with
+         blue held under red warms them toward pink. */
       color: { value: new THREE.Color(1.0, 0.42, 1.0) },
       emissionFactor: { value: 4.2 },
-      /* 0.35 was pushing 35% of every filament toward grey. The reference
-         runs 0: full channel separation, which is what makes it read pink. */
+      /* Any whiteness here pushes that channel separation back toward grey,
+         which is exactly what stops it reading pink. */
       emissionWhiteness: { value: 0.0 },
       interpol: { value: 0.5 },
-      /* The reference clamps this slider to 0.1 and this build was at 0.28,
-         straight into the blue channel. It is a tinted term now, so the
-         value is an intensity and the colour lives in rippleTint. */
+      /* An intensity, not a colour: the hue lives in rippleTint, so the
+         cursor wake belongs to the same palette as the filaments instead of
+         adding raw blue. */
       blueness: { value: 0.5 },
       rippleTint: { value: new THREE.Color(1.0, 0.18, 0.62) },
-      /* The ripple quad REDRAWS the background over the disc: at 0.85 it
-         was erasing 85% of the filaments under it. It only needs enough
-         presence for the cursor shimmer. */
+      /* The ripple quad REDRAWS the background over its disc, so a high
+         opacity here erases the filaments underneath it. It needs just
+         enough presence for the cursor shimmer. */
       opacity: { value: type < 1 ? 1.0 : 0.4 },
       simpleTexel: { value: new THREE.Vector2(1 / RIPPLE_SIM_SIZE, 1 / RIPPLE_SIM_SIZE) },
       // Subtle heat-haze, not a lens blob.
@@ -330,26 +162,14 @@ function makeCloud(type: number): THREE.ShaderMaterial {
 const fluidCloudMat = makeCloud(0);
 const rippleCloudMat = makeCloud(1);
 
-/* THE CENTER DEAD-ZONE FIX. The fluid goes back to a FULLSCREEN overlay.
-
-   The tilted-disc experiment is what killed the cursor in the middle of the
-   page. The disc leaned back at -1.02 rad, so the ray through the CENTER of
-   the screen struck it out near its far edge - the region that perspective
-   compresses into a few dozen pixels at the horizon. Your center-screen
-   swirls were being drawn - into a sliver the size of a matchstick, off
-   behind the feather. Only rays through the lower half / sides hit the near
-   part of the disc where UV space is roomy, which is exactly the "works at
-   the corners, dead in the middle" behaviour you saw.
-
-   The reference never does this. Its Water consumer (class dl in the
-   bundle) is a screen quad: one unit of cursor motion is one unit of fluid
-   motion everywhere on the page, center included. The receding-ellipse look
-   in its hero comes from the cloud IMAGERY, not from tilting the sim.
-
-   Rendered with blitCam (identity matrices), CLOUD_VERTEX degenerates to a
-   screen quad with the standard overscan shrink, so vUv == final screen UV
-   and the same shader serves both consumers unchanged. renderOrder keeps
-   the fluid under the ripple shimmer. */
+/* Both consumers are FULLSCREEN quads, and that is what keeps the cursor
+   alive in the middle of the page. An earlier build tilted the fluid onto a
+   receding 3D disc; the ray through the centre of the screen then struck it
+   near its far edge, where perspective compresses UV space into a few dozen
+   pixels, so centre-screen swirls were drawn into a sliver. Rendered with
+   blitCam (identity matrices) CLOUD_VERTEX degenerates to a screen quad, so
+   one unit of cursor motion is one unit of fluid motion everywhere.
+   renderOrder keeps the fluid under the ripple shimmer. */
 const fluidCloudMesh = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), fluidCloudMat);
 fluidCloudMesh.renderOrder = 0;
 cloudScene.add(fluidCloudMesh);
@@ -376,6 +196,21 @@ const blitMat = new THREE.ShaderMaterial({
 blitScene.add(new THREE.Mesh(new THREE.PlaneGeometry(2, 2), blitMat));
 const blitCam = new THREE.Camera();
 
+/* ── The page as a texture ─────────────────────────────────────────────── */
+
+/* Built from the DOM, not instead of it. Nothing downstream consumes this
+   yet and the display path is unchanged: the browser still paints the text
+   and the CSS screen blend still composites the canvas over it. This exists
+   so the shaders have the page available to sample, which is the one thing
+   they cannot do while the type lives only in the DOM.
+
+   Kept out of the frame loop deliberately. It re-rasters on resize and on
+   font load, both of which are layout events, and a per-frame rebuild would
+   cost a full Canvas2D repaint plus a texture upload for a surface that has
+   not changed. */
+const pageRoot = document.querySelector('.page') as HTMLElement | null;
+const pageTexture = pageRoot ? new PageTexture({ root: pageRoot, renderer }) : null;
+
 /* ── Cursor trail overlay ──────────────────────────────────────────────── */
 
 const trailScene = new THREE.Scene();
@@ -394,146 +229,10 @@ const trailMat = new THREE.ShaderMaterial({
 });
 trailScene.add(new THREE.Mesh(new THREE.PlaneGeometry(2, 2), trailMat));
 
-/* ── The feather ───────────────────────────────────────────────────────── */
-
-const featherScene = new THREE.Scene();
-let featherMesh: THREE.Mesh | null = null;
-let glassMat: THREE.ShaderMaterial | null = null;
-let glassBackMat: THREE.ShaderMaterial | null = null;
-const spawnerMaterial = new THREE.ShaderMaterial({
-  vertexShader: SPAWNER_VERTEX,
-  fragmentShader: SPAWNER_FRAGMENT,
-});
-
 const texLoader = new THREE.TextureLoader();
-const colorsMap = makeColorsLUT();
-const noiseMap = texLoader.load('/textures/bluenoise.png');
-noiseMap.wrapS = noiseMap.wrapT = THREE.RepeatWrapping;
-noiseMap.minFilter = noiseMap.magFilter = THREE.NearestFilter;
 const wavesMap = texLoader.load('/textures/waves.jpg');
 wavesMap.wrapS = wavesMap.wrapT = THREE.RepeatWrapping;
 trailMat.uniforms.noisesMap.value = wavesMap;
-
-new RGBELoader().load('/textures/wooden_studio_19_1k.hdr', (hdr) => {
-  hdr.wrapS = THREE.RepeatWrapping;
-  if (glassMat) glassMat.uniforms.envMap.value = hdr;
-  if (glassBackMat) glassBackMat.uniforms.envMap.value = hdr;
-  pendingEnv = hdr;
-});
-let pendingEnv: THREE.Texture | null = null;
-
-const draco = new DRACOLoader();
-draco.setDecoderPath('/draco/');
-const gltf = new GLTFLoader();
-gltf.setDRACOLoader(draco);
-gltf.load('/models/feather.glb', (g) => {
-  const source = g.scene.getObjectByProperty('type', 'Mesh') as THREE.Mesh | null;
-  if (!source) return;
-  const geo = source.geometry as THREE.BufferGeometry;
-  geo.center();
-  geo.computeBoundingBox();
-  const bb = geo.boundingBox as THREE.Box3;
-  const height = bb.max.y - bb.min.y;
-  const scale = 1.9 / height;
-
-  /* _thickness is authored in model units, but the refraction march happens
-     in world space: unscaled, both refraction rays land on the same pixel
-     and there is no dispersion at all. Normalise so the thickest point
-     pushes the ray ~0.3 world units, whatever the asset's own scale. */
-  const thicknessAttr = geo.getAttribute('_thickness') as THREE.BufferAttribute | undefined;
-  let maxThickness = 0.1;
-  if (thicknessAttr) {
-    for (let i = 0; i < thicknessAttr.count; i++) {
-      maxThickness = Math.max(maxThickness, thicknessAttr.getX(i));
-    }
-  }
-  const thicknessScale = 0.3 / maxThickness;
-
-  /* Shared uniform values, all from the reference's settings timeline
-     (timelines/dev.glb - one Blender empty per uniform, xyz = values):
-       Glass_iorVDeltaXshift                  [1.3, 3, 1]
-       Glass_colorBoostFactorCurve            [1.55, 1, 0.95]
-       Glass_fringeCurveMix                   [4, 0.55, 0]
-       Glass_convexConcavePeaks               [0.5, 0.5, 3]
-       Glass_reflectionVIri                   [1, 0.2, 0]   (envReflection, reflectionIridescence)
-       Glass_refractionVIri                   [0.6, 0.15, 0] (envRefraction, refractionIridescence)
-       Glass_colorMaxvalDecayUsetransmittance [50, 20, 1]
-       Glass_colorCurveRGB                    [1.15, 1.2, 1.1]
-       Glass_distResetX                       [0, 1, 0]
-       Glass_color 212,234,255 · Glass_peaksColor 253,208,221 · Glass_fringeColor 243,208,242
-     With the two-pass architecture in place these are used AS-IS - no more
-     compensating (the 0.85 iridescence / 2.3 env reflection hacks existed
-     only because the interior pass was missing). */
-  const shared = () => ({
-    map: { value: null as THREE.Texture | null },
-    envMap: { value: pendingEnv },
-    colorsMap: { value: colorsMap },
-    noiseMap: { value: noiseMap },
-    seconds: { value: 0 },
-    iorStart: { value: 1.3 },
-    iorDelta: { value: 3.0 },
-    useTransmittance: { value: 1 },
-    fringeMix: { value: 0.55 },
-    fringeCurve: { value: 4.0 },
-    fringeColor: { value: new THREE.Color(243 / 255, 208 / 255, 242 / 255) },
-    distancesFactor: { value: thicknessScale },
-    resetDistances: { value: 1 }, // constant 0.1 world-unit march, both passes
-    peaksFactor: { value: 3.0 },
-    baseColor: { value: new THREE.Color(212 / 255, 234 / 255, 255 / 255) },
-    peaksColor: { value: new THREE.Color(253 / 255, 208 / 255, 221 / 255) },
-  });
-
-  /* PASS 1 - the interior. Back faces only, reads rtBG (scene without the
-     feather), writes dispersion + refracted warm environment + confetti
-     iridescence into rtBack. This pass is where the peach/cyan/pink lives. */
-  glassBackMat = new THREE.ShaderMaterial({
-    vertexShader: GLASS_BACK_VERTEX,
-    fragmentShader: GLASS_BACK_FRAGMENT,
-    uniforms: {
-      ...shared(),
-      uvShiftFactor: { value: 1.0 },
-      /* Reference is 0.6 - against ITS backdrop: a scene full of bright varied
-         content (sun sprite, crystals, pale Env_background) whose five taps
-         differ enough for the spectrum weights to tint each facet. Our hero
-         behind the blade is a smooth blue gradient, so the taps come back
-         near-identical and the palette normalisation cancels itself. The env
-         term substitutes as the bright base...  */
-      envRefraction: { value: 1.6 },
-      /* ...and the confetti LUT carves that bright base into per-facet hue
-         patches (peach / cyan / pink - the multiplier can only subtract, so
-         it needs the bright base above to bite into). Reference runs 0.15
-         because its tap variance already does most of this. */
-      refractionIridescence: { value: 0.55 },
-    },
-    side: THREE.BackSide,
-    depthTest: false,
-    depthWrite: false,
-  });
-
-  /* PASS 2 - the front surface, reads rtBack (scene WITH the interior). */
-  glassMat = new THREE.ShaderMaterial({
-    vertexShader: GLASS_VERTEX,
-    fragmentShader: GLASS_FRAGMENT,
-    uniforms: {
-      ...shared(),
-      colorBoost: { value: 1.55 },
-      decayFactor: { value: 20 },
-      reflectionIridescence: { value: 0.2 },
-      colorFactor: { value: 1.0 },
-      colorCurve: { value: 0.95 },
-      colorCurveR: { value: 1.15 },
-      colorCurveG: { value: 1.2 },
-      colorCurveB: { value: 1.1 },
-      envReflection: { value: 1.0 },
-      maxColorValue: { value: 50 },
-    },
-  });
-  featherMesh = new THREE.Mesh(geo, glassMat);
-  featherMesh.scale.setScalar(scale);
-  featherMesh.position.set(0, 0.15, 0);
-  featherMesh.frustumCulled = false;
-  featherScene.add(featherMesh);
-});
 
 /* ── Pointer ───────────────────────────────────────────────────────────── */
 
@@ -541,8 +240,17 @@ const pointerNow = new THREE.Vector2(0.5, 0.5);
 
 /* Screen space in, screen space out. No raycast, no disc, no overscan
    arithmetic: the fluid UV is the screen UV, so the splat is born exactly
-   under the cursor - center of the page included. */
+   under the cursor - centre of the page included. */
+/* Stamping the clock in here rather than in the listener means every route
+   into the simulation counts as activity, including the scripted pointer the
+   verification harness drives. Two call sites setting the same flag is how it
+   drifts. */
+let lastPointerMs = Number.NEGATIVE_INFINITY;
+let pointerInside = false;
+
 function feedPointer(x: number, y: number): void {
+  lastPointerMs = performance.now();
+  pointerInside = true;
   pointerNow.set(x, y);
   ripple.setPointer(x, y);
   fluid.setPointer(x, y);
@@ -550,31 +258,20 @@ function feedPointer(x: number, y: number): void {
 window.addEventListener('pointermove', (e) => {
   feedPointer(e.clientX / window.innerWidth, 1 - e.clientY / window.innerHeight);
 });
+/* Leaving the window hands over immediately instead of waiting out the idle
+   timer: the cursor is gone, so there is nothing to defer to. */
+window.addEventListener('pointerleave', () => {
+  pointerInside = false;
+});
+window.addEventListener('blur', () => {
+  pointerInside = false;
+});
 
 // Cursor ring (DOM), eased in dt so it feels identical at any refresh rate.
 const ring = document.querySelector('.cursor-ring') as HTMLElement | null;
 const ringPos = new THREE.Vector2(innerWidth / 2, innerHeight / 2);
 const ringTarget = new THREE.Vector2(innerWidth / 2, innerHeight / 2);
 window.addEventListener('pointermove', (e) => ringTarget.set(e.clientX, e.clientY));
-
-/* ── Intro flourish: a few scripted splats so the fluid is alive before
-   the first pointer move (and deterministic under verification). ───────── */
-
-let introT = 0;
-const INTRO_SPLATS: [number, number, number, number, number][] = [
-  [0.3, 0.42, 0.55, 0.004, 0.003],
-  [0.8, 0.62, 0.45, -0.004, 0.002],
-  [1.4, 0.5, 0.65, 0.002, -0.003],
-  [2.0, 0.38, 0.6, 0.003, 0.002],
-];
-let nextSplat = 0;
-
-/* The ember churn is GONE. Four invisible emitters were stirring the sim
-   every frame, which is why the field never went quiet: the reference's
-   hero is completely clean until the cursor moves (its idle frame is just
-   the blue gradient and the feather), and every filament on it is one the
-   visitor drew. The fluid now has exactly two inputs: the cursor, and the
-   feather's own faint exhale. */
 
 /* ── Resize ────────────────────────────────────────────────────────────── */
 
@@ -591,14 +288,119 @@ window.addEventListener('resize', () => {
     camera.updateProjectionMatrix();
     fluid.resize(FLUID_PIXELS, w / h);
     ripple.setAspect(w / h);
-    for (const rt of [rtA, rtBG, rtBack, rtFinal]) rt.dispose();
+    for (const rt of [rtA, rtBG]) rt.dispose();
     rtA = makeSceneTarget();
     rtBG = makeSceneTarget();
-    rtBack = makeSceneTarget();
-    rtFinal = makeSceneTarget();
     post.resize(Math.round(w * DPR), Math.round(h * DPR));
+    /* After the render targets, so the re-raster measures a DOM that has
+       already been laid out at the new size. Measuring first would bake the
+       old grid into the texture. */
+    pageTexture?.resize();
   });
 });
+
+/* ── Ambient drift ─────────────────────────────────────────────────────── */
+
+/*
+  Keeps the fluid alive when nobody is touching it.
+
+  It drives `fluid.setPointer`, the same entry the real cursor uses, rather
+  than injecting through `splatAt`. That is the whole trick: the ambient
+  motion is not a second effect that has to be tuned to resemble the first,
+  it IS the first, moved by an invisible hand. Anything tuned about the
+  cursor's feel is inherited for free and cannot drift out of sync with it.
+
+  Handing over is the part that needs care. `doSplat` clamps the velocity it
+  injects, but it still stamps the splat ALONG the segment from the previous
+  point to the current one, so a jump between the drift path and a real
+  cursor sitting elsewhere paints a streak right across the frame even though
+  the impulse itself is capped. The fix costs one line: on a handover, feed
+  the new position twice. The first call leaves prev pointing at the old
+  source, the second overwrites prev with the new position, the measured
+  delta collapses to zero, and the frame that would have drawn the streak
+  draws nothing at all.
+*/
+
+/** Quiet time before the drift takes over, in ms. */
+const AMBIENT_IDLE_MS = 1400;
+
+/*
+  Peak speed of the invisible hand, in path-radians per ms.
+
+  The splat strength is proportional to how far the pointer travelled since
+  the last frame, so this number is an intensity control, not just a tempo.
+  It was first set at 0.0004, which works out to a per-frame delta of about
+  0.003 - and the constant at the top of FluidSim records a real, deliberate
+  cursor flick as 0.0034. The page was therefore flicking itself at nearly
+  full strength sixty times a second, and inside ten seconds the frame was a
+  solid sheet of dye with no black left in it.
+*/
+const AMBIENT_RATE = 0.00026;
+
+/*
+  Strokes, not a drag.
+
+  A hand moving at a constant rate has no resting point: it deposits dye
+  every frame, dissipation never catches up, and the field climbs until it
+  saturates. Gating the speed behind a slow envelope gives the solver long
+  stretches to settle in, so the field finds an equilibrium well under
+  saturation instead of running away.
+
+  Cubed rather than raw, because a plain sine spends half its time near full
+  speed. Cubing pushes the mean down to a third while leaving the peaks
+  intact, which turns a continuous drag into occasional strokes with rests
+  between them - much closer to how somebody actually moves a cursor.
+*/
+const AMBIENT_ENVELOPE_RATE = 0.00035;
+
+/* Four incommensurate frequencies, so the path never closes on itself. A
+   single sine reads as a pendulum within about two passes; layering a second
+   term at a non-integer multiple pushes the true period out past any time
+   anyone spends on the page. */
+function ambientAt(phase: number): { x: number; y: number } {
+  return {
+    x: 0.5 + 0.3 * Math.sin(phase) + 0.08 * Math.sin(phase * 2.3 + 1.1),
+    y: 0.5 + 0.2 * Math.cos(phase * 1.37) + 0.06 * Math.cos(phase * 3.1 + 0.6),
+  };
+}
+
+let ambientRunning = false;
+/* Advanced by the envelope rather than read off the clock, so the pauses are
+   real pauses in the path and not just a quieter push along it. */
+let ambientPhase = 0;
+let ambientPrevMs = 0;
+
+function driveAmbient(nowMs: number): void {
+  if (!SHOW.ambient) return;
+
+  const idle = !pointerInside || nowMs - lastPointerMs > AMBIENT_IDLE_MS;
+
+  if (!idle) {
+    if (ambientRunning) {
+      ambientRunning = false;
+      /* Swallow the handover, or the fluid streaks from wherever the drift
+         had wandered back to the real cursor. */
+      fluid.setPointer(pointerNow.x, pointerNow.y);
+      fluid.setPointer(pointerNow.x, pointerNow.y);
+    }
+    return;
+  }
+
+  /* Clamped: a backgrounded tab returns with a huge gap, and an unclamped
+     step would advance the phase far enough to teleport the hand. */
+  const dt = ambientPrevMs === 0 ? 16 : Math.min(nowMs - ambientPrevMs, 50);
+  ambientPrevMs = nowMs;
+
+  const swell = 0.5 + 0.5 * Math.sin(nowMs * AMBIENT_ENVELOPE_RATE);
+  ambientPhase += dt * AMBIENT_RATE * swell * swell * swell;
+
+  const p = ambientAt(ambientPhase);
+  if (!ambientRunning) {
+    ambientRunning = true;
+    fluid.setPointer(p.x, p.y);
+  }
+  fluid.setPointer(p.x, p.y);
+}
 
 /* ── Frame loop ────────────────────────────────────────────────────────── */
 
@@ -614,43 +416,20 @@ function frame(): void {
   const dt = Math.min(clock.getDelta(), 0.1);
   const seconds = clock.elapsedTime;
 
-  introT += dt;
-  while (nextSplat < INTRO_SPLATS.length && introT > INTRO_SPLATS[nextSplat][0]) {
-    const [, x, y, dx, dy] = INTRO_SPLATS[nextSplat++];
-    fluid.splatAt(x, y, dx, dy);
-  }
-
-  // 1. Spawner silhouette: the feather, flat white, rendered from the MAIN
-  //    camera. With the fluid fullscreen again its UV is screen UV, and the
-  //    plain (un-overscanned) SPAWNER_VERTEX projection lands the
-  //    silhouette exactly where the feather sits on the final screen - the
-  //    1.25 shrink at draw time and the 1.25 zoom at composite time cancel.
-  let spawnerTex: THREE.Texture | null = null;
-  if (featherMesh) {
-    const prev = featherMesh.material;
-    featherMesh.material = spawnerMaterial;
-    renderer.setRenderTarget(spawnerRT);
-    renderer.setClearColor(0x000000, 1);
-    renderer.clear(true, true, false);
-    renderer.render(featherScene, camera);
-    featherMesh.material = prev;
-    spawnerTex = spawnerRT.texture;
-  }
-
-  // 2. Simulations. The spawner breathes; the embers stir continuously.
-  const breath = 0.7 + 0.3 * Math.sin(seconds * 0.5);
-  fluid.step(spawnerTex, SPAWN_VELOCITY * breath * dt * 60, SPAWN_DENSITY * breath * dt * 60);
+  /* 1. Simulations. Nothing injects into the fluid but the pointer: there is
+        no emitter breathing into it, so an untouched page stays completely
+        still and every filament on screen is one the visitor drew. */
+  driveAmbient(performance.now());
+  fluid.step(null, 0, 0);
   ripple.step(seconds);
 
-  // 3. Background -> rtA.
+  // 2. Background -> rtA.
   bgMat.uniforms.seconds.value = seconds;
-  dustMat.uniforms.seconds.value = seconds;
-  sparkMat.uniforms.seconds.value = seconds;
   renderer.setRenderTarget(rtA);
   renderer.clear(true, true, false);
   renderer.render(bgScene, camera);
 
-  // 4. rtA + clouds -> rtBG.
+  // 3. rtA + clouds -> rtBG.
   blitMat.uniforms.map.value = rtA.texture;
   renderer.setRenderTarget(rtBG);
   renderer.clear(true, true, false);
@@ -664,43 +443,11 @@ function frame(): void {
   rippleCloudMesh.visible = SHOW.rippleCloud;
   renderer.render(cloudScene, blitCam); // fluid + ripple, both screen-space
 
-  // 5. rtBG + the feather's BACK-face pass -> rtBack. The interior: five
-  //    spectral taps of rtBG plus the warm environment along each refracted
-  //    ray, times the confetti iridescence. The front pass then refracts
-  //    THIS texture - that layering is the reference's holographic blade.
-  if (featherMesh && glassBackMat && SHOW.feather) {
-    featherMesh.rotation.y = seconds * 0.45;
-    featherMesh.position.y = 0.15 + Math.sin(seconds * 0.6) * 0.05;
-  }
-  blitMat.uniforms.map.value = rtBG.texture;
-  renderer.setRenderTarget(rtBack);
-  renderer.clear(true, true, false);
-  renderer.render(blitScene, blitCam);
-  if (featherMesh && glassBackMat && SHOW.feather) {
-    const prev = featherMesh.material;
-    featherMesh.material = glassBackMat;
-    glassBackMat.uniforms.map.value = rtBG.texture;
-    glassBackMat.uniforms.seconds.value = seconds;
-    renderer.render(featherScene, camera);
-    featherMesh.material = prev;
-  }
-
-  // 6. rtBack + the feather's FRONT pass -> rtFinal.
-  blitMat.uniforms.map.value = rtBack.texture;
-  renderer.setRenderTarget(rtFinal);
-  renderer.clear(true, true, false);
-  renderer.render(blitScene, blitCam);
-  if (featherMesh && glassMat && SHOW.feather) {
-    glassMat.uniforms.map.value = rtBack.texture;
-    glassMat.uniforms.seconds.value = seconds;
-    renderer.render(featherScene, camera);
-  }
-
-  // 7. Post to screen, then the trail overlay on top.
+  // 4. Post to screen, then the trail overlay on top.
   if (SHOW.post) {
-    post.render(rtFinal, seconds);
+    post.render(rtBG, seconds);
   } else {
-    blitMat.uniforms.map.value = rtFinal.texture;
+    blitMat.uniforms.map.value = rtBG.texture;
     renderer.setRenderTarget(null);
     renderer.render(blitScene, blitCam);
   }
@@ -708,6 +455,16 @@ function frame(): void {
     trailMat.uniforms.trailMap.value = ripple.texture;
     trailMat.uniforms.seconds.value = seconds;
     renderer.render(trailScene, blitCam);
+  }
+
+  /* Verification only. A raw blit with no colour conversion at either end:
+     the texture is untagged and the renderer outputs linear, so the sRGB
+     bytes Canvas2D wrote reach the screen unchanged. That makes the result
+     directly comparable to a screenshot of the DOM. */
+  if (SHOW.pageTexture && pageTexture) {
+    blitMat.uniforms.map.value = pageTexture.texture;
+    renderer.setRenderTarget(null);
+    renderer.render(blitScene, blitCam);
   }
 
   // Cursor ring easing.
@@ -727,8 +484,6 @@ window.__hero = {
   stats: () => ({
     dpr: DPR,
     fluidPixels: FLUID_PIXELS,
-    feather: !!featherMesh,
-    env: !!(glassMat?.uniforms.envMap.value ?? pendingEnv),
     contextAlive: !renderer.getContext().isContextLost(),
   }),
 };
